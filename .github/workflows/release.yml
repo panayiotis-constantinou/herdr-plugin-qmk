@@ -3,12 +3,28 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
 
 permissions:
   contents: write
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release view "$RELEASE_TAG" || gh release create "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA"
+
   build:
+    needs: release
     strategy:
       matrix:
         include:
@@ -28,6 +44,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - run: tar -C target/${{ matrix.target }}/release -czf qmk-herdr-${{ matrix.target }}.tar.gz qmk-herdr
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: qmk-herdr-${{ matrix.target }}.tar.gz
+      - run: gh release upload "$RELEASE_TAG" qmk-herdr-${{ matrix.target }}.tar.gz --clobber
