@@ -1,9 +1,9 @@
 id = "panayiotis.qmk-herdr"
 name = "QMK Herdr"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
 description = "Mirror Herdr agent state on a QMK keyboard over USB MIDI"
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 [[startup]]
 command = ["sh", "scripts/plugin.sh", "restart"]

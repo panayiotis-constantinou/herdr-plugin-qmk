@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Mirror Herdr agent state on a QMK keyboard over USB MIDI (ALSA rawmidi).
+"""Mirror Herdr agent state on a QMK keyboard over USB MIDI.
 
 Stdlib only: talks to Herdr's Unix socket (newline-delimited JSON-RPC) and
-writes MIDI bytes straight to the ALSA rawmidi device node. No compiled
-binary, no ALSA client libraries.
+sends MIDI via the platform backend — the ALSA rawmidi device node on Linux,
+CoreMIDI through ctypes on macOS. No compiled binary, no dependencies.
 """
 
+import ctypes
 import glob
 import json
 import os
 import re
 import socket
+import struct
 import sys
 import time
 
@@ -22,11 +24,12 @@ PROTOCOL = 1
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
+MIDI_PACKET_DATA_SIZE = 256
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
 STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
 
-CARD_RE = re.compile(r"\s*(\d+)\s*\[\s*(\S+)\s*\]\s*:\s*(\S+)\s+-\s*(.*)$")
+CARD_RE = re.compile(r"\s*(\d+)\s*\[\s*(\S+)\s*\]\s*:\s*(\S+)\s+-\s+(.*)$")
 
 
 def log(message):
@@ -37,25 +40,57 @@ class BridgeError(Exception):
     pass
 
 
+def build_packet_list(messages):
+    """Pack MIDI messages as a MIDIPacketList: UInt32 count, then per packet
+    UInt64 timestamp, UInt16 length, and a fixed 256-byte data buffer."""
+    packets = b"".join(
+        struct.pack("<QH", 0, len(message)) + bytes(message).ljust(
+            MIDI_PACKET_DATA_SIZE, b"\x00"
+        )
+        for message in messages
+    )
+    return struct.pack("<I", len(messages)) + packets
+
+
 class MidiOut:
-    """Write-side handle on the ALSA rawmidi node of a USB MIDI card."""
+    """Minimal send-side MIDI interface shared by the platform backends."""
 
     def __init__(self, name):
         self.name = name
+
+    def heartbeat(self):
+        self.send(CC_HEARTBEAT, PROTOCOL)
+
+    def send(self, control, value):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class AlsaMidiOut(MidiOut):
+    """Write-side handle on the ALSA rawmidi node of a USB MIDI card."""
+
+    def __init__(self, name):
+        super().__init__(name)
         self.fd = None
 
     def open(self):
         needle = self.name.lower()
         cards = []
-        for line in open("/proc/asound/cards"):
-            match = CARD_RE.match(line.rstrip("\n"))
-            if not match:
-                continue
-            index, card_id, _module, long_name = match.groups()
-            cards.append((int(index), long_name.strip()))
+        try:
+            with open("/proc/asound/cards") as cards_file:
+                for line in cards_file:
+                    match = CARD_RE.match(line.rstrip("\n"))
+                    if not match:
+                        continue
+                    index, _card_id, _module, long_name = match.groups()
+                    cards.append((int(index), long_name.strip()))
+        except OSError as error:
+            raise BridgeError(f"cannot list ALSA cards: {error}") from error
         matches = [c for c in cards if needle in c[1].lower()]
         if not matches:
-            available = ", ".join(f"{c[1]}" for c in cards) or "none"
+            available = ", ".join(c[1] for c in cards) or "none"
             raise BridgeError(
                 f"no ALSA MIDI card matching {self.name!r}; available: {available}"
             )
@@ -81,8 +116,152 @@ class MidiOut:
         except BlockingIOError:
             pass  # ponytail: drop the message; next frame or heartbeat resends
 
-    def heartbeat(self):
-        self.send(CC_HEARTBEAT, PROTOCOL)
+
+class CoreMidiOut(MidiOut):
+    """macOS backend: sends MIDIPacketLists through CoreMIDI via ctypes."""
+
+    UTF8 = 0x08000100  # kCFStringEncodingUTF8
+
+    _cm: ctypes.CDLL
+    _cf: ctypes.CDLL
+    _client = 0
+    _port = 0
+    _endpoint = 0
+
+    def __init__(self, name):
+        super().__init__(name)
+
+    def _cf_string(self, text):
+        self._cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        self._cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
+        return self._cf.CFStringCreateWithCString(
+            None, text.encode("utf-8"), self.UTF8
+        )
+
+    def _display_name(self, midi_object, selector):
+        out = ctypes.c_void_p()
+        status = self._cm.MIDIObjectGetStringProperty(
+            midi_object, selector, ctypes.byref(out)
+        )
+        if status != 0:
+            return ""
+        buffer = ctypes.create_string_buffer(256)
+        ok = self._cf.CFStringGetCString(out, buffer, 256, self.UTF8)
+        self._cf.CFRelease(out)
+        return buffer.value.decode("utf-8") if ok else ""
+
+    def _declare_signatures(self):
+        cm, cf = self._cm, self._cf
+        cm.MIDIClientCreate.restype = ctypes.c_int32
+        cm.MIDIClientCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        cm.MIDIOutputPortCreate.restype = ctypes.c_int32
+        cm.MIDIOutputPortCreate.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        cm.MIDIGetNumberOfDestinations.restype = ctypes.c_uint32
+        cm.MIDIGetDestination.restype = ctypes.c_uint32
+        cm.MIDIGetDestination.argtypes = [ctypes.c_uint32]
+        cm.MIDIObjectGetStringProperty.restype = ctypes.c_int32
+        cm.MIDIObjectGetStringProperty.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        cm.MIDISend.restype = ctypes.c_int32
+        cm.MIDISend.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+        ]
+        cm.MIDIClientDispose.restype = ctypes.c_int32
+        cm.MIDIClientDispose.argtypes = [ctypes.c_uint32]
+        cf.CFRelease.restype = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFStringGetCString.restype = ctypes.c_ubyte
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_long,
+            ctypes.c_uint32,
+        ]
+
+    def open(self):
+        try:
+            self._cm = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreMIDI.framework/CoreMIDI"
+            )
+            self._cf = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+        except OSError as error:
+            raise BridgeError(f"cannot load CoreMIDI: {error}") from error
+        self._declare_signatures()
+        cm, cf = self._cm, self._cf
+
+        client = ctypes.c_uint32()
+        client_name = self._cf_string("qmk-herdr")
+        status = cm.MIDIClientCreate(client_name, None, None, ctypes.byref(client))
+        cf.CFRelease(client_name)
+        if status != 0:
+            raise BridgeError(f"MIDIClientCreate failed: {status}")
+        port = ctypes.c_uint32()
+        port_name = self._cf_string("qmk-herdr")
+        status = cm.MIDIOutputPortCreate(client, port_name, ctypes.byref(port))
+        cf.CFRelease(port_name)
+        if status != 0:
+            raise BridgeError(f"MIDIOutputPortCreate failed: {status}")
+        self._client = client.value
+        self._port = port.value
+
+        selector = ctypes.c_void_p.in_dll(cm, "kMIDIPropertyDisplayName")
+        needle = self.name.lower()
+        names = []
+        endpoint = 0
+        for index in range(cm.MIDIGetNumberOfDestinations()):
+            candidate = cm.MIDIGetDestination(index)
+            name = self._display_name(candidate, selector)
+            names.append(name)
+            if not endpoint and needle in name.lower():
+                endpoint = candidate
+        if not endpoint:
+            available = ", ".join(names) or "none"
+            raise BridgeError(
+                f"no CoreMIDI destination matching {self.name!r};"
+                f" available: {available}"
+            )
+        self._endpoint = endpoint
+
+    def close(self):
+        if self._client:
+            self._cm.MIDIClientDispose(self._client)
+            self._client = 0
+            self._port = 0
+            self._endpoint = 0
+
+    def send(self, control, value):
+        if not self._endpoint:
+            raise BridgeError("MIDI destination is closed")
+        packet_list = build_packet_list([(MIDI_CHANNEL, control, value)])
+        status = self._cm.MIDISend(self._port, self._endpoint, packet_list)
+        if status != 0:
+            raise BridgeError(f"MIDISend failed: {status}")
+
+
+def make_midi_out(name):
+    if sys.platform == "darwin":
+        return CoreMidiOut(name)
+    return AlsaMidiOut(name)
 
 
 class Tracker:
@@ -140,10 +319,10 @@ class Tracker:
         for index, status in enumerate(frame["slots"]):
             midi.send(CC_SLOT_FIRST + index, status)
         value = STATUS_CODES.get(frame["aggregate"], 4)
-        value |= int(frame["any_working"]) << 3
-        value |= int(frame["overflow"]) << 4
-        value |= int(frame["chime_done"]) << 5
-        value |= int(frame["chime_blocked"]) << 6
+        value |= frame["any_working"] << 3
+        value |= frame["overflow"] << 4
+        value |= frame["chime_done"] << 5
+        value |= frame["chime_blocked"] << 6
         midi.send(CC_STATE, value)
 
 
@@ -160,8 +339,11 @@ def snapshot(socket_path):
             if not chunk:
                 raise BridgeError("snapshot connection closed")
             data += chunk
-        response = json.loads(data.split(b"\n", 1)[0])
-        return response["result"]["snapshot"]["agents"]
+        try:
+            response = json.loads(data.split(b"\n", 1)[0])
+            return response["result"]["snapshot"]["agents"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise BridgeError(f"malformed snapshot response: {error}") from error
 
 
 def subscription_request(agents):
@@ -196,7 +378,10 @@ def watch_session(socket_path, midi, tracker):
             if not chunk:
                 raise BridgeError("event stream closed before ack")
             data += chunk
-        ack = json.loads(data.split(b"\n", 1)[0])
+        try:
+            ack = json.loads(data.split(b"\n", 1)[0])
+        except ValueError as error:
+            raise BridgeError(f"malformed subscription ack: {error}") from error
         if ack.get("result", {}).get("type") != "subscription_started":
             raise BridgeError(f"Herdr rejected event subscription: {ack}")
 
@@ -227,12 +412,12 @@ def watch_session(socket_path, midi, tracker):
 
 
 def run(socket_path, port_name):
-    midi = MidiOut(port_name)
+    midi = make_midi_out(port_name)
     tracker = Tracker()
     while True:
         try:
             midi.open()
-            log(f"connected to MIDI card matching {port_name!r}")
+            log(f"connected to MIDI matching {port_name!r}")
             watch_session(socket_path, midi, tracker)
         except Exception as error:  # any failure becomes a logged retry, never a dead daemon
             midi.close()
@@ -272,9 +457,22 @@ def self_test():
     )
     assert overflow["overflow"] and overflow["slots"] == [0, 0, 0, 0], overflow
 
-    request = json.loads(subscription_request([{"pane_id": "w1:p1"}]))
-    assert len(request["params"]["subscriptions"]) == 4
-    assert request["params"]["subscriptions"][3]["pane_id"] == "w1:p1"
+    request = subscription_request([{"pane_id": "w1:p1"}])
+    assert request.count(b'"type"') == 4
+    assert b'"pane_id": "w1:p1"' in request
+
+    packet_list = build_packet_list([(MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL), (MIDI_CHANNEL, CC_STATE, 3)])
+    (num_packets,) = struct.unpack_from("<I", packet_list, 0)
+    assert num_packets == 2
+    offset = 4
+    for expected in ([MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL], [MIDI_CHANNEL, CC_STATE, 3]):
+        stamp, length = struct.unpack_from("<QH", packet_list, offset)
+        assert stamp == 0
+        assert length == 3
+        data = packet_list[offset + 10 : offset + 10 + 3]
+        assert list(data) == expected
+        offset += 10 + MIDI_PACKET_DATA_SIZE
+    assert offset == len(packet_list)
 
     frame = dict(overflow)
     frame.update(aggregate="done", any_working=False, overflow=False, chime_done=True, chime_blocked=False)
@@ -293,8 +491,8 @@ def self_test():
     tracker.send_frame(fake, frame)
     assert fake.sent[0] == "hb"
     value = STATUS_CODES["done"] | 1 << 5
-    expected = (CC_STATE, value)
-    assert fake.sent[-1] == expected, fake.sent[-1]
+    expected_state = (CC_STATE, value)
+    assert fake.sent[-1] == expected_state, fake.sent[-1]
     print("self-test ok")
 
 

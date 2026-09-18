@@ -1,10 +1,12 @@
 # QMK Herdr
 
-A Herdr plugin that mirrors agent state on a QMK keyboard over USB MIDI. A single stdlib-Python script (`scripts/bridge.py`) is the whole bridge: it talks to Herdr's local socket and writes MIDI bytes straight to the keyboard's ALSA rawmidi device. No compiled binary, no build step.
+A Herdr plugin that mirrors agent state on a QMK keyboard over USB MIDI. A single stdlib-Python script (`scripts/bridge.py`) is the whole bridge: it talks to Herdr's local socket and sends MIDI through the platform backend — the ALSA rawmidi device node on Linux, CoreMIDI via ctypes on macOS. No compiled binary, no build step, no dependencies.
 
 ## Requirements
 
-Linux with the QMK keyboard connected over USB. The keyboard firmware must expose the USB MIDI interface; the plugin writes to the matching `/dev/snd/midiC*D*` device node (granted to the active seat user by default).
+- Linux or macOS with the QMK keyboard connected over USB. The keyboard firmware must expose the USB MIDI interface.
+- Linux writes to the matching `/dev/snd/midiC*D*` device node (granted to the active seat user by default).
+- macOS sends through CoreMIDI. `python3` ships with the Xcode Command Line Tools; override the interpreter with `HERDR_QMK_PYTHON` if needed.
 
 ## Install
 
@@ -12,7 +14,7 @@ Linux with the QMK keyboard connected over USB. The keyboard firmware must expos
 herdr plugin install panayiotis-constantinou/herdr-plugin-qmk
 ```
 
-Restart Herdr after installing so the startup hook runs. The bridge matches the first ALSA card whose name contains `Planck EZ`.
+Restart Herdr after installing so the startup hook runs. The bridge matches the first MIDI device whose name contains `Planck EZ` (ALSA card on Linux, CoreMIDI destination on macOS).
 
 For a different device name, write the case-insensitive substring to the plugin config directory, then restart the bridge:
 
