@@ -5,7 +5,8 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 state_dir=${HERDR_PLUGIN_STATE_DIR:?HERDR_PLUGIN_STATE_DIR is missing}
 pidfile="$state_dir/qmk-herdr.pid"
 logfile="$state_dir/qmk-herdr.log"
-binary="$root/bin/qmk-herdr"
+bridge="$root/scripts/bridge.py"
+python=${HERDR_QMK_PYTHON:-python3}
 mkdir -p "$state_dir"
 
 running() {
@@ -13,7 +14,7 @@ running() {
   pid=$(cat "$pidfile")
   case "$pid" in *[!0-9]* | '') return 1 ;; esac
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -p "$pid" -o command= 2>/dev/null | grep -F "$binary" >/dev/null
+  ps -p "$pid" -o command= 2>/dev/null | grep -F "$bridge" >/dev/null
 }
 
 stop() {
@@ -30,8 +31,8 @@ stop() {
 }
 
 start() {
-  [ -x "$binary" ] || {
-    echo "qmk-herdr: missing $binary; reinstall the plugin" >&2
+  [ -f "$bridge" ] || {
+    echo "qmk-herdr: missing $bridge; reinstall the plugin" >&2
     exit 1
   }
   running && {
@@ -42,9 +43,9 @@ start() {
   : >"$logfile"
   port_file="${HERDR_PLUGIN_CONFIG_DIR:?HERDR_PLUGIN_CONFIG_DIR is missing}/midi-port"
   if [ -s "$port_file" ]; then
-    nohup "$binary" "$(cat "$port_file")" >>"$logfile" 2>&1 &
+    nohup "$python" "$bridge" "$(cat "$port_file")" >>"$logfile" 2>&1 &
   else
-    nohup "$binary" >>"$logfile" 2>&1 &
+    nohup "$python" "$bridge" >>"$logfile" 2>&1 &
   fi
   echo $! >"$pidfile"
   sleep 0.2

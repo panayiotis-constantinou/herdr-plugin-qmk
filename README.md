@@ -1,6 +1,10 @@
 # QMK Herdr
 
-A Herdr plugin that mirrors agent state on a Planck EZ Glow running the matching QMK keymap. It uses Herdr's local socket API and USB MIDI.
+A Herdr plugin that mirrors agent state on a QMK keyboard over USB MIDI. A single stdlib-Python script (`scripts/bridge.py`) is the whole bridge: it talks to Herdr's local socket and writes MIDI bytes straight to the keyboard's ALSA rawmidi device. No compiled binary, no build step.
+
+## Requirements
+
+Linux with the QMK keyboard connected over USB. The keyboard firmware must expose the USB MIDI interface; the plugin writes to the matching `/dev/snd/midiC*D*` device node (granted to the active seat user by default).
 
 ## Install
 
@@ -8,12 +12,12 @@ A Herdr plugin that mirrors agent state on a Planck EZ Glow running the matching
 herdr plugin install panayiotis-constantinou/herdr-plugin-qmk
 ```
 
-Restart Herdr after installing so the startup hook runs. The plugin selects the first MIDI output containing `Planck EZ`.
+Restart Herdr after installing so the startup hook runs. The bridge matches the first ALSA card whose name contains `Planck EZ`.
 
 For a different device name, write the case-insensitive substring to the plugin config directory, then restart the bridge:
 
 ```sh
-printf '%s\n' 'Planck EZ Glow' > "$(herdr plugin config-dir panayiotis.qmk-herdr)/midi-port"
+printf '%s\n' 'Moonlander' > "$(herdr plugin config-dir panayiotis.qmk-herdr)/midi-port"
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
 
@@ -28,10 +32,7 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 ## Develop
 
 ```sh
-nix develop
-cargo test
-cargo build --release
-mkdir -p bin && cp target/release/qmk-herdr bin/
+python3 scripts/bridge.py --self-test
 herdr plugin link --enabled .
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
