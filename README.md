@@ -1,34 +1,42 @@
-# qmk-herdr
+# QMK Herdr
 
-A small foreground bridge that mirrors the current Herdr session on a Planck EZ Glow running the matching QMK keymap. It uses Herdr's local socket API and USB MIDI: no daemon, system service, or Herdr plugin.
-
-## Run
-
-Start it from a shell pane inside Herdr so `HERDR_SOCKET_PATH` is available:
-
-```sh
-nix run
-```
-
-The first MIDI output containing `Planck EZ` is selected. Pass a different case-insensitive substring when needed:
-
-```sh
-nix run . -- "Planck EZ Glow"
-```
-
-The process stays in the foreground; stop it with Ctrl-C.
+A Herdr plugin that mirrors agent state on a Planck EZ Glow running the matching QMK keymap. It uses Herdr's local socket API and USB MIDI.
 
 ## Install
 
-With Nix:
-
 ```sh
-nix profile install .
+herdr plugin install panayiotis-constantinou/herdr-plugin-qmk
 ```
 
-Without Nix, download the archive for Linux or macOS from a tagged GitHub release, unpack it, and place `qmk-herdr` on `PATH`. Release artifacts are produced after this local repository is published and a `v*` tag is pushed.
+Restart Herdr after installing so the startup hook runs. The plugin selects the first MIDI output containing `Planck EZ`.
 
-Linux builds use ALSA (`libasound`). macOS uses CoreMIDI.
+For a different device name, write the case-insensitive substring to the plugin config directory, then restart the bridge:
+
+```sh
+printf '%s\n' 'Planck EZ Glow' > "$(herdr plugin config-dir panayiotis.qmk-herdr)/midi-port"
+herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
+```
+
+Useful actions:
+
+```sh
+herdr plugin action invoke status --plugin panayiotis.qmk-herdr
+herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
+herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
+```
+
+## Develop
+
+```sh
+nix develop
+cargo test
+cargo build --release
+mkdir -p bin && cp target/release/qmk-herdr bin/
+herdr plugin link --enabled .
+herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
+```
+
+The process log is `qmk-herdr.log` under `HERDR_PLUGIN_STATE_DIR`; Herdr exposes action output with `herdr plugin log`.
 
 ## Keyboard display
 

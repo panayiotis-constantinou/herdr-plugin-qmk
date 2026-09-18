@@ -1,0 +1,30 @@
+id = "panayiotis.qmk-herdr"
+name = "QMK Herdr"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Mirror Herdr agent state on a QMK keyboard over USB MIDI"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/install.sh"]
+
+[[startup]]
+command = ["sh", "scripts/plugin.sh", "restart"]
+
+[[actions]]
+id = "restart"
+title = "Restart QMK bridge"
+contexts = ["workspace"]
+command = ["sh", "scripts/plugin.sh", "restart"]
+
+[[actions]]
+id = "stop"
+title = "Stop QMK bridge"
+contexts = ["workspace"]
+command = ["sh", "scripts/plugin.sh", "stop"]
+
+[[actions]]
+id = "status"
+title = "Show QMK bridge status"
+contexts = ["workspace"]
+command = ["sh", "scripts/plugin.sh", "status"]
