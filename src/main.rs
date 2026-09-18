@@ -285,12 +285,15 @@ fn run() -> Result<()> {
     let socket = env::var_os("HERDR_SOCKET_PATH")
         .ok_or("HERDR_SOCKET_PATH is missing; run qmk-herdr inside a Herdr pane")?;
     let port = env::args().nth(1).unwrap_or_else(|| "Planck EZ".into());
-    let mut midi = open_midi(&port)?;
     let mut tracker = Tracker::new();
-    eprintln!("qmk-herdr: connected to MIDI output matching {port:?}");
 
     loop {
-        if let Err(error) = watch_session(Path::new(&socket), &mut midi, &mut tracker) {
+        let attempt = (|| -> Result<()> {
+            let mut midi = open_midi(&port)?;
+            eprintln!("qmk-herdr: connected to MIDI output matching {port:?}");
+            watch_session(Path::new(&socket), &mut midi, &mut tracker)
+        })();
+        if let Err(error) = attempt {
             eprintln!("qmk-herdr: {error}; reconnecting");
             thread::sleep(Duration::from_secs(1));
         }
