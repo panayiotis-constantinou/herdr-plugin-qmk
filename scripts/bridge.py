@@ -40,16 +40,14 @@ class BridgeError(Exception):
     pass
 
 
-def build_packet_list(messages):
-    """Pack MIDI messages as a MIDIPacketList: UInt32 count, then per packet
-    UInt64 timestamp, UInt16 length, and a fixed 256-byte data buffer."""
-    packets = b"".join(
-        struct.pack("<QH", 0, len(message)) + bytes(message).ljust(
-            MIDI_PACKET_DATA_SIZE, b"\x00"
-        )
-        for message in messages
-    )
-    return struct.pack("<I", len(messages)) + packets
+def build_packet_list(message):
+    """Pack one MIDI message as CoreMIDI's 4-byte-aligned MIDIPacketList."""
+    message = bytes(message)
+    if len(message) > MIDI_PACKET_DATA_SIZE:
+        raise ValueError("MIDI packet exceeds 256 bytes")
+    packet = struct.pack("<QH", 0, len(message))
+    packet += message.ljust(MIDI_PACKET_DATA_SIZE, b"\x00") + b"\x00\x00"
+    return struct.pack("<I", 1) + packet
 
 
 class MidiOut:
@@ -98,9 +96,14 @@ class AlsaMidiOut(MidiOut):
         nodes = sorted(glob.glob(f"/dev/snd/midiC{index}D*"))
         if not nodes:
             raise BridgeError(f"card {long_name!r} exposes no rawmidi device")
+        fd = None
         try:
-            self.fd = os.open(nodes[0], os.O_WRONLY | os.O_NONBLOCK)
+            fd = os.open(nodes[0], os.O_WRONLY | os.O_NONBLOCK)
+            os.set_blocking(fd, True)
+            self.fd = fd
         except OSError as error:
+            if fd is not None:
+                os.close(fd)
             raise BridgeError(f"cannot open {nodes[0]}: {error}") from error
 
     def close(self):
@@ -111,10 +114,9 @@ class AlsaMidiOut(MidiOut):
     def send(self, control, value):
         if self.fd is None:
             raise BridgeError("MIDI device is closed")
-        try:
-            os.write(self.fd, bytes((MIDI_CHANNEL, control, value)))
-        except BlockingIOError:
-            pass  # ponytail: drop the message; next frame or heartbeat resends
+        message = bytes((MIDI_CHANNEL, control, value))
+        if os.write(self.fd, message) != len(message):
+            raise BridgeError("incomplete MIDI write")
 
 
 class CoreMidiOut(MidiOut):
@@ -215,13 +217,14 @@ class CoreMidiOut(MidiOut):
         cf.CFRelease(client_name)
         if status != 0:
             raise BridgeError(f"MIDIClientCreate failed: {status}")
+        self._client = client.value
         port = ctypes.c_uint32()
         port_name = self._cf_string("qmk-herdr")
         status = cm.MIDIOutputPortCreate(client, port_name, ctypes.byref(port))
         cf.CFRelease(port_name)
         if status != 0:
+            self.close()
             raise BridgeError(f"MIDIOutputPortCreate failed: {status}")
-        self._client = client.value
         self._port = port.value
 
         selector = ctypes.c_void_p.in_dll(cm, "kMIDIPropertyDisplayName")
@@ -252,13 +255,98 @@ class CoreMidiOut(MidiOut):
     def send(self, control, value):
         if not self._endpoint:
             raise BridgeError("MIDI destination is closed")
-        packet_list = build_packet_list([(MIDI_CHANNEL, control, value)])
+        packet_list = build_packet_list((MIDI_CHANNEL, control, value))
         status = self._cm.MIDISend(self._port, self._endpoint, packet_list)
         if status != 0:
             raise BridgeError(f"MIDISend failed: {status}")
 
 
+class RtMidiOut(MidiOut):
+    """Send through a named CoreMIDI/ALSA sequencer destination via python-rtmidi."""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.midi = None
+        self.opened = False
+
+    def open(self):
+        if self.midi is None:
+            try:
+                import rtmidi
+            except ImportError as error:
+                raise BridgeError("rtmidi backend requires python-rtmidi") from error
+            self.midi = rtmidi.MidiOut()
+
+        ports = self.midi.get_ports()
+        match = next(
+            (index for index, port in enumerate(ports) if self.name.lower() in port.lower()),
+            None,
+        )
+        if match is None:
+            raise BridgeError(
+                f"no sequencer MIDI port matching {self.name!r}; available: "
+                + (", ".join(ports) or "none")
+            )
+        try:
+            self.midi.open_port(match)
+        except Exception as error:
+            raise BridgeError(f"cannot open sequencer port {ports[match]!r}: {error}") from error
+        self.opened = True
+
+    def close(self):
+        if self.midi is not None and self.opened:
+            self.midi.close_port()
+            self.midi = None
+            self.opened = False
+
+    def send(self, control, value):
+        if self.midi is None or not self.opened:
+            raise BridgeError("MIDI sequencer destination is closed")
+        self.midi.send_message([MIDI_CHANNEL, control, value])
+
+
+class FallbackMidiOut(MidiOut):
+    """Use the first available destination from a pipe-separated target list."""
+
+    def __init__(self, targets):
+        super().__init__(" | ".join(target.name for target in targets))
+        self.targets = targets
+        self.active = None
+
+    def open(self):
+        errors = []
+        for target in self.targets:
+            try:
+                target.open()
+                self.active = target
+                return
+            except Exception as error:
+                target.close()
+                errors.append(str(error))
+        raise BridgeError("; ".join(errors))
+
+    def close(self):
+        if self.active is not None:
+            self.active.close()
+            self.active = None
+
+    def send(self, control, value):
+        if self.active is None:
+            raise BridgeError("all MIDI destinations are closed")
+        self.active.send(control, value)
+
+
 def make_midi_out(name):
+    if "|" in name:
+        targets = [make_midi_out(target.strip()) for target in name.split("|") if target.strip()]
+        if not targets:
+            raise BridgeError("MIDI target list is empty")
+        return FallbackMidiOut(targets)
+    if name.startswith("rtmidi:"):
+        target = name.removeprefix("rtmidi:").strip()
+        if not target:
+            raise BridgeError("rtmidi target is empty")
+        return RtMidiOut(target)
     if sys.platform == "darwin":
         return CoreMidiOut(name)
     return AlsaMidiOut(name)
@@ -331,6 +419,7 @@ def snapshot(socket_path):
         {"id": "qmk-herdr-snapshot", "method": "session.snapshot", "params": {}}
     ).encode()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(HEARTBEAT_SECONDS)
         sock.connect(socket_path)
         sock.sendall(request + b"\n")
         data = b""
@@ -378,8 +467,9 @@ def watch_session(socket_path, midi, tracker):
             if not chunk:
                 raise BridgeError("event stream closed before ack")
             data += chunk
+        ack_line, data = data.split(b"\n", 1)
         try:
-            ack = json.loads(data.split(b"\n", 1)[0])
+            ack = json.loads(ack_line)
         except ValueError as error:
             raise BridgeError(f"malformed subscription ack: {error}") from error
         if ack.get("result", {}).get("type") != "subscription_started":
@@ -392,14 +482,6 @@ def watch_session(socket_path, midi, tracker):
             raise BridgeError("Herdr agent set changed; resubscribing")
 
         while True:
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout:
-                midi.heartbeat()
-                continue
-            if not chunk:
-                raise BridgeError("Herdr event stream closed")
-            data += chunk
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
                 if not line.strip():
@@ -409,19 +491,38 @@ def watch_session(socket_path, midi, tracker):
                 tracker.send_frame(midi, tracker.update(agents, notify=True))
                 if changed:
                     raise BridgeError("Herdr agent set changed; resubscribing")
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                midi.heartbeat()
+                continue
+            if not chunk:
+                raise BridgeError("Herdr event stream closed")
+            data += chunk
 
 
 def run(socket_path, port_name):
     midi = make_midi_out(port_name)
     tracker = Tracker()
+    last_error = None
+    midi_unavailable = True
     while True:
+        opened = False
         try:
             midi.open()
-            log(f"connected to MIDI matching {port_name!r}")
+            opened = True
+            if midi_unavailable:
+                log(f"connected to MIDI matching {port_name!r}")
+            midi_unavailable = False
             watch_session(socket_path, midi, tracker)
         except Exception as error:  # any failure becomes a logged retry, never a dead daemon
             midi.close()
-            log(f"{error}; reconnecting")
+            if not opened:
+                midi_unavailable = True
+            message = f"{error}; reconnecting"
+            if message != last_error:
+                log(message)
+                last_error = message
             time.sleep(1)
 
 
@@ -461,18 +562,14 @@ def self_test():
     assert request.count(b'"type"') == 4
     assert b'"pane_id": "w1:p1"' in request
 
-    packet_list = build_packet_list([(MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL), (MIDI_CHANNEL, CC_STATE, 3)])
-    (num_packets,) = struct.unpack_from("<I", packet_list, 0)
-    assert num_packets == 2
-    offset = 4
-    for expected in ([MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL], [MIDI_CHANNEL, CC_STATE, 3]):
-        stamp, length = struct.unpack_from("<QH", packet_list, offset)
-        assert stamp == 0
-        assert length == 3
-        data = packet_list[offset + 10 : offset + 10 + 3]
-        assert list(data) == expected
-        offset += 10 + MIDI_PACKET_DATA_SIZE
-    assert offset == len(packet_list)
+    expected = [MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]
+    packet_list = build_packet_list(expected)
+    num_packets, stamp, length = struct.unpack_from("<IQH", packet_list, 0)
+    assert num_packets == 1
+    assert stamp == 0
+    assert length == 3
+    assert list(packet_list[14:17]) == expected
+    assert len(packet_list) == 4 + 8 + 2 + MIDI_PACKET_DATA_SIZE + 2
 
     frame = dict(overflow)
     frame.update(aggregate="done", any_working=False, overflow=False, chime_done=True, chime_blocked=False)
@@ -493,6 +590,60 @@ def self_test():
     value = STATUS_CODES["done"] | 1 << 5
     expected_state = (CC_STATE, value)
     assert fake.sent[-1] == expected_state, fake.sent[-1]
+
+    class FakeRtMidi:
+        instances = []
+
+        def __init__(self):
+            self.opened = None
+            self.sent = []
+            self.closed = False
+            self.instances.append(self)
+
+        def get_ports(self):
+            return ["unrelated", "qmk-herdr-ipad"]
+
+        def open_port(self, index):
+            self.opened = index
+
+        def send_message(self, message):
+            self.sent.append(message)
+
+        def close_port(self):
+            self.closed = True
+
+    previous_rtmidi = sys.modules.get("rtmidi")
+    sys.modules["rtmidi"] = type("FakeRtMidiModule", (), {"MidiOut": FakeRtMidi})
+    try:
+        output = make_midi_out("rtmidi:HERDR-IPAD")
+        output.open()
+        output.send(CC_HEARTBEAT, PROTOCOL)
+        output.close()
+        instance = FakeRtMidi.instances[-1]
+        assert instance.opened == 1
+        assert instance.sent == [[MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]]
+        assert instance.closed
+
+        missing = make_midi_out("rtmidi:missing")
+        before = len(FakeRtMidi.instances)
+        for _ in range(2):
+            try:
+                missing.open()
+            except BridgeError:
+                pass
+            else:
+                raise AssertionError("missing RtMidi port opened")
+        assert len(FakeRtMidi.instances) == before + 1
+    finally:
+        if previous_rtmidi is None:
+            del sys.modules["rtmidi"]
+        else:
+            sys.modules["rtmidi"] = previous_rtmidi
+
+    fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
+    assert isinstance(fallback, FallbackMidiOut)
+    assert isinstance(fallback.targets[0], CoreMidiOut if sys.platform == "darwin" else AlsaMidiOut)
+    assert isinstance(fallback.targets[1], RtMidiOut)
     print("self-test ok")
 
 

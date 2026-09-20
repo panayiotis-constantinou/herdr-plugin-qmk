@@ -6,7 +6,11 @@ state_dir=${HERDR_PLUGIN_STATE_DIR:?HERDR_PLUGIN_STATE_DIR is missing}
 pidfile="$state_dir/qmk-herdr.pid"
 logfile="$state_dir/qmk-herdr.log"
 bridge="$root/scripts/bridge.py"
+config_dir=${HERDR_PLUGIN_CONFIG_DIR:?HERDR_PLUGIN_CONFIG_DIR is missing}
 python=${HERDR_QMK_PYTHON:-python3}
+if [ -s "$config_dir/python" ]; then
+  python=$(cat "$config_dir/python")
+fi
 mkdir -p "$state_dir"
 
 running() {
@@ -41,7 +45,7 @@ start() {
   }
   rm -f "$pidfile"
   : >"$logfile"
-  port_file="${HERDR_PLUGIN_CONFIG_DIR:?HERDR_PLUGIN_CONFIG_DIR is missing}/midi-port"
+  port_file="$config_dir/midi-port"
   if [ -s "$port_file" ]; then
     nohup "$python" "$bridge" "$(cat "$port_file")" >>"$logfile" 2>&1 &
   else
