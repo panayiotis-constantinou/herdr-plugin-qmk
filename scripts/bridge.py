@@ -6,10 +6,12 @@ sends MIDI via the platform backend — the ALSA rawmidi device node on Linux,
 CoreMIDI through ctypes on macOS. No compiled binary, no dependencies.
 """
 
+import concurrent.futures
 import ctypes
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -17,6 +19,9 @@ import struct
 import subprocess
 import sys
 import time
+import types
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 MIDI_CHANNEL = 0xBE  # MIDI channel 15 (status channels are zero-based)
 CC_WORKSPACE_PREV = 100
@@ -32,6 +37,12 @@ CC_SCRATCHPAD = 109
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
+CC_WORKSPACE_NEW = 116
+CC_TAB_NEW = 117
+CC_LAZYGIT = 118
+CC_PALETTE = 119
+CC_PANE_ZOOM = 120
+CC_HUNK = 121
 CC_ACCEPT = 124
 CC_REJECT = 125
 CC_PROMPT = 126
@@ -42,10 +53,17 @@ SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
 MIDI_POLL_SECONDS = 0.05
 COMMAND_TIMEOUT_SECONDS = 2.0
+TYPESAFE_TIMEOUT_SECONDS = 2.0
+TYPESAFE_MIN_CONFIDENCE = 0.7
+TYPESAFE_CHIME_THRESHOLD = 0.8
+TYPESAFE_API_URL = "https://api.typesafe.ai/v1/systemone"
 MIDI_PACKET_DATA_SIZE = 256
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
 STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
+STATUS_RANK = {
+    status: len(STATUS_PRIORITY) - index for index, status in enumerate(STATUS_PRIORITY)
+}
 
 CARD_RE = re.compile(r"\s*(\d+)\s*\[\s*(\S+)\s*\]\s*:\s*(\S+)\s+-\s+(.*)$")
 
@@ -77,8 +95,8 @@ class MidiOut:
     def heartbeat(self):
         self.send(CC_HEARTBEAT, PROTOCOL)
 
-    def send(self, control, value):
-        raise NotImplementedError
+    def send(self, control, value) -> None:
+        raise BridgeError("MIDI backend does not implement send")
 
     def receive(self):
         return []
@@ -208,9 +226,7 @@ class CoreMidiOut(MidiOut):
             ctypes.c_char_p,
             ctypes.c_uint32,
         ]
-        return self._cf.CFStringCreateWithCString(
-            None, text.encode("utf-8"), self.UTF8
-        )
+        return self._cf.CFStringCreateWithCString(None, text.encode("utf-8"), self.UTF8)
 
     def _display_name(self, midi_object, selector):
         out = ctypes.c_void_p()
@@ -341,20 +357,32 @@ class RtMidiOut(MidiOut):
     def open(self):
         if self.midi_out is None:
             try:
-                import rtmidi
+                import rtmidi  # type: ignore[import-not-found]
             except ImportError as error:
                 raise BridgeError("rtmidi backend requires python-rtmidi") from error
             self.midi_out = rtmidi.MidiOut()
             self.midi_in = rtmidi.MidiIn()
 
-        output_ports = self.midi_out.get_ports()
-        input_ports = self.midi_in.get_ports()
+        midi_out = self.midi_out
+        midi_in = self.midi_in
+        if midi_out is None or midi_in is None:
+            raise BridgeError("rtmidi backend did not initialize")
+        output_ports = midi_out.get_ports()
+        input_ports = midi_in.get_ports()
         output_match = next(
-            (index for index, port in enumerate(output_ports) if self.name.lower() in port.lower()),
+            (
+                index
+                for index, port in enumerate(output_ports)
+                if self.name.lower() in port.lower()
+            ),
             None,
         )
         input_match = next(
-            (index for index, port in enumerate(input_ports) if self.name.lower() in port.lower()),
+            (
+                index
+                for index, port in enumerate(input_ports)
+                if self.name.lower() in port.lower()
+            ),
             None,
         )
         if output_match is None or input_match is None:
@@ -364,12 +392,14 @@ class RtMidiOut(MidiOut):
                 f"inputs: {', '.join(input_ports) or 'none'}"
             )
         try:
-            self.midi_out.open_port(output_match)
-            self.midi_in.open_port(input_match)
-            self.midi_in.ignore_types(sysex=True, timing=True, active_sense=True)
+            midi_out.open_port(output_match)
+            midi_in.open_port(input_match)
+            midi_in.ignore_types(sysex=True, timing=True, active_sense=True)
         except Exception as error:
             self.close()
-            raise BridgeError(f"cannot open sequencer port matching {self.name!r}: {error}") from error
+            raise BridgeError(
+                f"cannot open sequencer port matching {self.name!r}: {error}"
+            ) from error
         self.opened = True
 
     def close(self):
@@ -437,7 +467,11 @@ class FallbackMidiOut(MidiOut):
 
 def make_midi_out(name):
     if "|" in name:
-        targets = [make_midi_out(target.strip()) for target in name.split("|") if target.strip()]
+        targets = [
+            make_midi_out(target.strip())
+            for target in name.split("|")
+            if target.strip()
+        ]
         if not targets:
             raise BridgeError("MIDI target list is empty")
         return FallbackMidiOut(targets)
@@ -454,7 +488,10 @@ def make_midi_out(name):
 def run_herdr(*args):
     try:
         process = subprocess.run(
-            ["herdr", *args], capture_output=True, text=True, check=False,
+            ["herdr", *args],
+            capture_output=True,
+            text=True,
+            check=False,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
@@ -480,7 +517,10 @@ def read_clipboard():
             continue
         try:
             process = subprocess.run(
-                command, capture_output=True, text=True, check=False,
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
@@ -490,11 +530,358 @@ def read_clipboard():
     raise BridgeError("prompt requires non-empty clipboard text")
 
 
+class TypeSafeClient:
+    """Small stdlib client for TypeSafe System One."""
+
+    def __init__(self, api_key=None, model=None, opener=None):
+        self.api_key = (
+            api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")
+        ).strip()
+        self.model = model or os.environ.get("TYPESAFE_MODEL", "jev-latest")
+        self.opener = opener if opener is not None else urlopen
+
+    @property
+    def enabled(self):
+        return self.api_key != ""
+
+    def evaluate(self, state, questions):
+        if not self.enabled:
+            raise BridgeError("TypeSafe is not configured")
+        payload = json.dumps(
+            {"state": state, "model": self.model, "questions": questions}
+        ).encode()
+        request = Request(
+            TYPESAFE_API_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with self.opener(request, timeout=TYPESAFE_TIMEOUT_SECONDS) as response:
+                data = response.read(1_000_001)
+        except HTTPError as error:
+            detail = error.read(512).decode("utf-8", "replace").strip()
+            if not detail:
+                detail = str(error.reason)
+            raise BridgeError(f"TypeSafe HTTP {error.code}: {detail}") from error
+        except OSError as error:
+            raise BridgeError(f"TypeSafe request failed: {error}") from error
+        if len(data) > 1_000_000:
+            raise BridgeError("TypeSafe response exceeds 1 MB")
+        try:
+            response = json.loads(data)
+        except ValueError as error:
+            raise BridgeError(f"malformed TypeSafe response: {error}") from error
+        if not isinstance(response, dict) or not isinstance(
+            response.get("answers"), dict
+        ):
+            raise BridgeError("malformed TypeSafe response: answers is not an object")
+        return response["answers"]
+
+
+class TypeSafeAutomation:
+    """Optional semantic decisions; code still owns all side effects."""
+
+    AGENT_FIELDS = (
+        "pane_id",
+        "workspace_id",
+        "cwd",
+        "title",
+        "terminal_title_stripped",
+        "agent_status",
+        "focused",
+        "state_change_seq",
+    )
+
+    def __init__(self, client=None, command=run_herdr, executor=None):
+        self.client = client or TypeSafeClient()
+        self.command = command
+        self.executor = executor
+        if self.client.enabled and self.executor is None:
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.results = queue.SimpleQueue()
+        self.agents = []
+        self.signature = ()
+        self.slot_scores = {}
+        self.rank_key = None
+        self.last_error = None
+
+    @staticmethod
+    def _agent(agent):
+        return {
+            field: agent.get(field)
+            for field in TypeSafeAutomation.AGENT_FIELDS
+            if agent.get(field) is not None
+        }
+
+    @staticmethod
+    def _number(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _signature(agents):
+        return tuple(
+            sorted(
+                (
+                    agent["pane_id"],
+                    agent.get("agent_status"),
+                    agent.get("state_change_seq"),
+                )
+                for agent in agents
+            )
+        )
+
+    @staticmethod
+    def _ranking_key(agents):
+        return tuple(
+            sorted(
+                (
+                    agent["pane_id"],
+                    agent.get("workspace_id"),
+                    agent.get("cwd"),
+                    agent.get("title"),
+                    agent.get("terminal_title_stripped"),
+                )
+                for agent in agents
+            )
+        )
+
+    def _submit(self, kind, context, state, questions):
+        if not self.client.enabled or self.executor is None:
+            return False
+        future = self.executor.submit(self.client.evaluate, state, questions)
+
+        def done(completed):
+            try:
+                result = (kind, context, completed.result(), None)
+            except Exception as error:
+                result = (kind, context, None, error)
+            self.results.put(result)
+
+        future.add_done_callback(done)
+        return True
+
+    def route_prompt(self, prompt, focused_pane_id):
+        if not self.client.enabled:
+            return False
+        try:
+            agents = self.command("agent", "list")["agents"]
+            workspaces = {
+                item["workspace_id"]: item.get("label", "")
+                for item in self.command("workspace", "list")["workspaces"]
+            }
+        except Exception:
+            return False
+        candidates = []
+        criteria = {}
+        option_to_pane = {}
+        for index, agent in enumerate(agents):
+            candidate = self._agent(agent)
+            candidate["workspace_label"] = workspaces.get(agent.get("workspace_id"), "")
+            candidates.append(candidate)
+            option = f"agent_{index}"
+            option_to_pane[option] = agent["pane_id"]
+            criteria[option] = (
+                f"Agent in {candidate.get('workspace_label') or candidate.get('cwd')}; "
+                f"task/title: {candidate.get('title') or candidate.get('terminal_title_stripped')}; "
+                f"status: {candidate.get('agent_status')}"
+            )
+        if not candidates:
+            return False
+        criteria["no_match"] = "No live agent is meaningfully related to the prompt"
+        state = {"prompt": prompt[:4000], "agents": candidates}
+        questions = {
+            "target": {
+                "type": "choice",
+                "instructions": (
+                    "Which live agent is best suited to receive `prompt`? Choose by "
+                    "project and task relevance, not merely current activity."
+                ),
+                "criteria": criteria,
+            }
+        }
+        context = {
+            "prompt": prompt,
+            "focused": focused_pane_id,
+            "option_to_pane": option_to_pane,
+            "deadline": time.monotonic() + 5.0,
+        }
+        return self._submit("prompt", context, state, questions)
+
+    def _schedule_ranking(self, agents):
+        key = self._ranking_key(agents)
+        if len(agents) <= SLOT_COUNT or key == self.rank_key:
+            return
+        self.rank_key = key
+        if not self.client.enabled:
+            return
+        summaries = [self._agent(agent) for agent in agents]
+        questions = {}
+        question_to_pane = {}
+        for index, agent in enumerate(agents):
+            question = f"agent_{index}"
+            question_to_pane[question] = agent["pane_id"]
+            questions[question] = {
+                "type": "score",
+                "instructions": {
+                    "question": (
+                        "How useful is it to keep this agent visible in one of four "
+                        "keyboard status slots when agents of the same status compete?"
+                    ),
+                    "pane_id": agent["pane_id"],
+                    "guidance": (
+                        "Judge semantic project/task relevance only; deterministic code "
+                        "already prioritizes blocked and working statuses."
+                    ),
+                },
+                "criteria": [
+                    "Little current value to monitor",
+                    "Some value to monitor",
+                    "Useful to keep visible",
+                    "Especially important to keep visible",
+                ],
+            }
+        self._submit(
+            "rank",
+            {"key": key, "question_to_pane": question_to_pane},
+            {"agents": summaries},
+            questions,
+        )
+
+    def publish(self, midi, tracker, agents, notify):
+        self.agents = [dict(agent) for agent in agents]
+        self.signature = self._signature(self.agents)
+        frame = tracker.update(self.agents, notify=notify, scores=self.slot_scores)
+        self._schedule_ranking(self.agents)
+        if frame["chime_blocked"] or not self.client.enabled or not frame["chime_done"]:
+            tracker.send_frame(midi, frame)
+            return
+
+        silent = dict(frame, chime_done=False)
+        tracker.send_frame(midi, silent)
+        self._submit(
+            "chime",
+            {"signature": self.signature},
+            {
+                "transitions": frame["transitions"],
+                "agents": [self._agent(agent) for agent in self.agents],
+            },
+            {
+                "done": {
+                    "type": "noul",
+                    "instructions": (
+                        "Would an audible cue help the user notice the completed background "
+                        "agent transition in `transitions` now?"
+                    ),
+                    "criteria": {
+                        "true": "The completion is useful to notice away from its pane",
+                        "false": (
+                            "It is focused, routine, duplicate, or not worth interrupting"
+                        ),
+                    },
+                }
+            },
+        )
+
+    def _apply_prompt(self, context, answers, error):
+        if time.monotonic() > context["deadline"]:
+            log("smart prompt expired before routing")
+            return
+        target = None
+        if error is None:
+            answer = answers.get("target", {})
+            if (
+                answer.get("type") == "choice"
+                and self._number(answer.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE
+            ):
+                if answer.get("choice") == "no_match":
+                    log("smart prompt found no suitable live agent")
+                    return
+                target = context["option_to_pane"].get(answer.get("choice"))
+        try:
+            live = {
+                agent["pane_id"] for agent in self.command("agent", "list")["agents"]
+            }
+            if target not in live:
+                target = context["focused"] if context["focused"] in live else None
+            if target is None:
+                log("smart prompt found no suitable live agent")
+                return
+            self.command("agent", "prompt", target, context["prompt"])
+            log(f"smart prompt routed to {target}")
+        except Exception as prompt_error:
+            log(f"smart prompt failed: {prompt_error}")
+
+    def _apply_chime(self, midi, tracker, context, answers, error):
+        if context["signature"] != self.signature:
+            return
+        frame = tracker.update(self.agents, notify=False, scores=self.slot_scores)
+
+        def allowed(question, requested):
+            if not requested:
+                return False
+            if error is not None:
+                return True
+            answer = answers.get(question, {})
+            if answer.get("type") != "noul":
+                return True
+            return self._number(answer.get("noul"), 1.0) >= TYPESAFE_CHIME_THRESHOLD
+
+        frame["chime_done"] = allowed("done", True)
+        frame["chime_blocked"] = False
+        if frame["chime_done"]:
+            tracker.send_frame(midi, frame)
+
+    def _apply_rank(self, midi, tracker, context, answers, error):
+        if error is not None or context["key"] != self.rank_key:
+            return
+        scores = {}
+        for question, pane_id in context["question_to_pane"].items():
+            answer = answers.get(question, {})
+            if (
+                answer.get("type") == "score"
+                and self._number(answer.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE
+            ):
+                scores[pane_id] = self._number(answer.get("score"))
+        self.slot_scores = scores
+        frame = tracker.update(self.agents, notify=False, scores=self.slot_scores)
+        tracker.send_frame(midi, frame)
+
+    def poll(self, midi, tracker):
+        while True:
+            try:
+                kind, context, answers, error = self.results.get_nowait()
+            except queue.Empty:
+                return
+            if error is not None:
+                message = str(error)
+                if message != self.last_error:
+                    log(f"TypeSafe: {message}; using deterministic fallback")
+                    self.last_error = message
+            else:
+                self.last_error = None
+            if kind == "prompt":
+                self._apply_prompt(context, answers or {}, error)
+            elif kind == "chime":
+                self._apply_chime(midi, tracker, context, answers or {}, error)
+            elif kind == "rank":
+                self._apply_rank(midi, tracker, context, answers or {}, error)
+
+
 class HerdrController:
-    def __init__(self, tracker, command=run_herdr, clipboard=read_clipboard):
+    def __init__(
+        self, tracker, command=run_herdr, clipboard=read_clipboard, automation=None
+    ):
         self.tracker = tracker
         self.command = command
         self.clipboard = clipboard
+        self.automation = automation
 
     def _focused_workspace(self):
         workspaces = self.command("workspace", "list")["workspaces"]
@@ -504,7 +891,9 @@ class HerdrController:
         workspace = self._focused_workspace()
         if workspace is None:
             raise BridgeError("Herdr has no focused workspace")
-        panes = self.command("pane", "list", "--workspace", workspace["workspace_id"])["panes"]
+        panes = self.command("pane", "list", "--workspace", workspace["workspace_id"])[
+            "panes"
+        ]
         pane = next((item for item in panes if item.get("focused")), None)
         if pane is None:
             raise BridgeError("Herdr has no focused pane")
@@ -517,7 +906,9 @@ class HerdrController:
         items = sorted(self.command(*args)[f"{kind}s"], key=lambda item: item["number"])
         if not items:
             raise BridgeError(f"Herdr has no {kind}s")
-        current = next((index for index, item in enumerate(items) if item.get("focused")), None)
+        current = next(
+            (index for index, item in enumerate(items) if item.get("focused")), None
+        )
         if current is None:
             raise BridgeError(f"Herdr has no focused {kind}")
         target = items[(current + delta) % len(items)][key]
@@ -551,19 +942,61 @@ class HerdrController:
             }
             pane = self._focused_pane()
             self.command(
-                "pane", "focus", "--direction", directions[control], "--pane", pane["pane_id"]
+                "pane",
+                "focus",
+                "--direction",
+                directions[control],
+                "--pane",
+                pane["pane_id"],
             )
         elif control == CC_AGENT_PICKER:
-            self.command("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump")
+            self.command(
+                "plugin", "action", "invoke", "open", "--plugin", "lancodev.jump"
+            )
         elif control == CC_SCRATCHPAD:
-            self.command("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax")
+            self.command(
+                "plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax"
+            )
+        elif control == CC_WORKSPACE_NEW:
+            pane = self._focused_pane()
+            self.command("workspace", "create", "--cwd", pane["cwd"], "--focus")
+        elif control == CC_TAB_NEW:
+            pane = self._focused_pane()
+            self.command(
+                "tab",
+                "create",
+                "--workspace",
+                pane["workspace_id"],
+                "--cwd",
+                pane["cwd"],
+                "--focus",
+            )
+        elif control == CC_LAZYGIT:
+            self.command(
+                "plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"
+            )
+        elif control == CC_PALETTE:
+            self.command(
+                "plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"
+            )
+        elif control == CC_PANE_ZOOM:
+            self.command("pane", "zoom", self._focused_pane()["pane_id"], "--toggle")
+        elif control == CC_HUNK:
+            self.command(
+                "plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"
+            )
         elif control in (CC_ACCEPT, CC_REJECT, CC_CLEAR):
             keys = {CC_ACCEPT: "enter", CC_REJECT: "esc", CC_CLEAR: "ctrl+c"}
-            self.command("agent", "send-keys", self._focused_pane()["pane_id"], keys[control])
-        elif control == CC_PROMPT:
             self.command(
-                "agent", "prompt", self._focused_pane()["pane_id"], self.clipboard()
+                "agent", "send-keys", self._focused_pane()["pane_id"], keys[control]
             )
+        elif control == CC_PROMPT:
+            pane_id = self._focused_pane()["pane_id"]
+            prompt = self.clipboard()
+            if self.automation is None or not self.automation.route_prompt(
+                prompt, pane_id
+            ):
+                self.command("agent", "prompt", pane_id, prompt)
         else:
             return False
         return True
@@ -584,35 +1017,37 @@ class Tracker:
         self.slots = [None] * SLOT_COUNT
         self.previous = {}
 
-    def update(self, agents, notify):
+    def update(self, agents, notify, scores=None):
+        scores = scores or {}
         agents = sorted(
-            agents, key=lambda a: (a.get("state_change_seq", 0), a["pane_id"])
+            agents,
+            key=lambda agent: (
+                -STATUS_RANK.get(agent["agent_status"], 0),
+                -scores.get(agent["pane_id"], 0),
+                agent.get("state_change_seq", 0),
+                agent["pane_id"],
+            ),
         )
-        live = {a["pane_id"] for a in agents}
-        self.slots = [s if s in live else None for s in self.slots]
-        for agent in agents:
-            pid = agent["pane_id"]
-            if pid in self.slots:
-                continue
-            if None in self.slots:
-                self.slots[self.slots.index(None)] = pid
+        wanted = [agent["pane_id"] for agent in agents[:SLOT_COUNT]]
+        self.slots = [slot if slot in wanted else None for slot in self.slots]
+        for pane_id in wanted:
+            if pane_id not in self.slots:
+                self.slots[self.slots.index(None)] = pane_id
 
         current = {a["pane_id"]: a["agent_status"] for a in agents}
+        transitions = [
+            {"pane_id": pane_id, "from": self.previous[pane_id], "to": status}
+            for pane_id, status in current.items()
+            if notify and pane_id in self.previous and self.previous[pane_id] != status
+        ]
 
         def changed_to(status):
-            return notify and any(
-                now == status
-                and pid in self.previous
-                and self.previous[pid] != status
-                for pid, now in current.items()
-            )
+            return any(transition["to"] == status for transition in transitions)
 
         def any_is(status):
             return any(a["agent_status"] == status for a in agents)
 
-        aggregate = next(
-            (s for s in STATUS_PRIORITY if any_is(s)), "idle"
-        )
+        aggregate = next((s for s in STATUS_PRIORITY if any_is(s)), "idle")
         frame = {
             "aggregate": aggregate,
             "slots": [
@@ -625,6 +1060,7 @@ class Tracker:
             "overflow": len(agents) > SLOT_COUNT,
             "chime_done": changed_to("done"),
             "chime_blocked": changed_to("blocked"),
+            "transitions": transitions,
         }
         self.previous = current
         return frame
@@ -667,10 +1103,7 @@ def subscription_request(agents):
         {"type": "pane.agent_detected"},
         {"type": "pane.closed"},
         {"type": "pane.exited"},
-    ] + [
-        {"type": "pane.agent_status_changed", "pane_id": a["pane_id"]}
-        for a in agents
-    ]
+    ] + [{"type": "pane.agent_status_changed", "pane_id": a["pane_id"]} for a in agents]
     return json.dumps(
         {
             "id": "qmk-herdr-subscribe",
@@ -680,7 +1113,7 @@ def subscription_request(agents):
     ).encode()
 
 
-def watch_session(socket_path, midi, tracker, controller):
+def watch_session(socket_path, midi, tracker, controller, automation):
     initial = snapshot(socket_path)
     subscribed = {a["pane_id"] for a in initial}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -704,7 +1137,7 @@ def watch_session(socket_path, midi, tracker, controller):
 
         agents = snapshot(socket_path)
         changed = {a["pane_id"] for a in agents} != subscribed
-        tracker.send_frame(midi, tracker.update(agents, notify=False))
+        automation.publish(midi, tracker, agents, notify=False)
         last_heartbeat = time.monotonic()
         if changed:
             raise BridgeError("Herdr agent set changed; resubscribing")
@@ -712,13 +1145,14 @@ def watch_session(socket_path, midi, tracker, controller):
         sock.settimeout(MIDI_POLL_SECONDS)
         while True:
             controller.poll(midi)
+            automation.poll(midi, tracker)
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
                 if not line.strip():
                     continue
                 agents = snapshot(socket_path)
                 changed = {a["pane_id"] for a in agents} != subscribed
-                tracker.send_frame(midi, tracker.update(agents, notify=True))
+                automation.publish(midi, tracker, agents, notify=True)
                 last_heartbeat = time.monotonic()
                 if changed:
                     raise BridgeError("Herdr agent set changed; resubscribing")
@@ -737,7 +1171,8 @@ def watch_session(socket_path, midi, tracker, controller):
 def run(socket_path, port_name):
     midi = make_midi_out(port_name)
     tracker = Tracker()
-    controller = HerdrController(tracker)
+    automation = TypeSafeAutomation()
+    controller = HerdrController(tracker, automation=automation)
     last_error = None
     midi_unavailable = True
     while True:
@@ -748,8 +1183,10 @@ def run(socket_path, port_name):
             if midi_unavailable:
                 log(f"connected to MIDI matching {port_name!r}")
             midi_unavailable = False
-            watch_session(socket_path, midi, tracker, controller)
-        except Exception as error:  # any failure becomes a logged retry, never a dead daemon
+            watch_session(socket_path, midi, tracker, controller, automation)
+        except (
+            Exception
+        ) as error:  # any failure becomes a logged retry, never a dead daemon
             midi.close()
             if not opened:
                 midi_unavailable = True
@@ -769,7 +1206,7 @@ def self_test():
         ],
         notify=False,
     )
-    assert first["slots"] == [0, 1, EMPTY_SLOT, EMPTY_SLOT], first
+    assert first["slots"] == [1, 0, EMPTY_SLOT, EMPTY_SLOT], first
     assert not first["chime_done"]
 
     second = tracker.update(
@@ -779,7 +1216,7 @@ def self_test():
         ],
         notify=True,
     )
-    assert second["slots"] == [2, 3, EMPTY_SLOT, EMPTY_SLOT], second
+    assert second["slots"] == [3, 2, EMPTY_SLOT, EMPTY_SLOT], second
     assert second["aggregate"] == "blocked"
     assert second["chime_done"] and second["chime_blocked"], second
 
@@ -797,17 +1234,20 @@ def self_test():
     assert b'"pane_id": "w1:p1"' in request
 
     parser = MidiParser()
-    assert parser.feed((MIDI_CHANNEL, CC_WORKSPACE_PREV)) == []
-    assert parser.feed((0xF8, 127, CC_WORKSPACE_NEXT, 127)) == [
+    parsed = parser.feed((MIDI_CHANNEL, CC_WORKSPACE_PREV))
+    assert parsed == []
+    parsed = parser.feed((0xF8, 127, CC_WORKSPACE_NEXT, 127))
+    expected_messages = [
         (MIDI_CHANNEL, CC_WORKSPACE_PREV, 127),
         (MIDI_CHANNEL, CC_WORKSPACE_NEXT, 127),
     ]
-    assert parser.feed((0xF0, 1, 2, 0xF7, MIDI_CHANNEL, CC_ACCEPT, 127)) == [
-        (MIDI_CHANNEL, CC_ACCEPT, 127)
-    ]
-    assert parser.feed((0xF1, 1, MIDI_CHANNEL, CC_REJECT, 127)) == [
-        (MIDI_CHANNEL, CC_REJECT, 127)
-    ]
+    assert parsed == expected_messages
+    parsed = parser.feed((0xF0, 1, 2, 0xF7, MIDI_CHANNEL, CC_ACCEPT, 127))
+    expected_messages = [(MIDI_CHANNEL, CC_ACCEPT, 127)]
+    assert parsed == expected_messages
+    parsed = parser.feed((0xF1, 1, MIDI_CHANNEL, CC_REJECT, 127))
+    expected_messages = [(MIDI_CHANNEL, CC_REJECT, 127)]
+    assert parsed == expected_messages
 
     expected = [MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]
     packet_list = build_packet_list(expected)
@@ -819,7 +1259,13 @@ def self_test():
     assert len(packet_list) == 4 + 8 + 2 + MIDI_PACKET_DATA_SIZE + 2
 
     frame = dict(overflow)
-    frame.update(aggregate="done", any_working=False, overflow=False, chime_done=True, chime_blocked=False)
+    frame.update(
+        aggregate="done",
+        any_working=False,
+        overflow=False,
+        chime_done=True,
+        chime_blocked=False,
+    )
 
     class FakeMidi:
         def __init__(self):
@@ -884,14 +1330,17 @@ def self_test():
             self.closed = True
 
     previous_rtmidi = sys.modules.get("rtmidi")
-    sys.modules["rtmidi"] = type(
-        "FakeRtMidiModule", (), {"MidiOut": FakeRtMidiOut, "MidiIn": FakeRtMidiIn}
-    )
+    fake_rtmidi = types.ModuleType("rtmidi")
+    setattr(fake_rtmidi, "MidiOut", FakeRtMidiOut)
+    setattr(fake_rtmidi, "MidiIn", FakeRtMidiIn)
+    sys.modules["rtmidi"] = fake_rtmidi
     try:
         output = make_midi_out("rtmidi:HERDR-IPAD")
         output.open()
         output.send(CC_HEARTBEAT, PROTOCOL)
-        assert output.receive() == [(MIDI_CHANNEL, CC_ACCEPT, 127)]
+        received = output.receive()
+        expected_messages = [(MIDI_CHANNEL, CC_ACCEPT, 127)]
+        assert received == expected_messages
         output.close()
         output_instance = FakeRtMidiOut.instances[-1]
         input_instance = FakeRtMidiIn.instances[-1]
@@ -919,43 +1368,287 @@ def self_test():
 
     def fake_herdr(*args):
         if args == ("workspace", "list"):
-            return {"workspaces": [
-                {"workspace_id": "w1", "number": 1, "focused": True},
-                {"workspace_id": "w2", "number": 2, "focused": False},
-            ]}
+            return {
+                "workspaces": [
+                    {"workspace_id": "w1", "number": 1, "focused": True},
+                    {"workspace_id": "w2", "number": 2, "focused": False},
+                ]
+            }
         if args == ("tab", "list", "--workspace", "w1"):
-            return {"tabs": [
-                {"tab_id": "w1:t1", "number": 1, "focused": True},
-                {"tab_id": "w1:t2", "number": 2, "focused": False},
-            ]}
+            return {
+                "tabs": [
+                    {"tab_id": "w1:t1", "number": 1, "focused": True},
+                    {"tab_id": "w1:t2", "number": 2, "focused": False},
+                ]
+            }
         if args == ("pane", "list", "--workspace", "w1"):
-            return {"panes": [{"pane_id": "w1:p1", "focused": True}]}
+            return {
+                "panes": [
+                    {
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "cwd": "/tmp/project",
+                        "focused": True,
+                    }
+                ]
+            }
         if args == ("agent", "list"):
             return {"agents": [{"pane_id": "w1:p1"}, {"pane_id": "w2:p3"}]}
         commands.append(args)
         return {}
 
     tracker.slots = ["w1:p2", None, None, None]
-    controller = HerdrController(tracker, command=fake_herdr, clipboard=lambda: "test prompt")
+    controller = HerdrController(
+        tracker, command=fake_herdr, clipboard=lambda: "test prompt"
+    )
     assert not controller.handle(CC_ACCEPT, 0)
     for control in (
-        CC_WORKSPACE_PREV, CC_WORKSPACE_NEXT, CC_TAB_PREV, CC_TAB_NEXT,
-        CC_PANE_LEFT, CC_PANE_DOWN, CC_PANE_UP, CC_PANE_RIGHT,
-        CC_AGENT_PICKER, CC_SCRATCHPAD, CC_ACCEPT, CC_REJECT, CC_PROMPT, CC_CLEAR,
+        CC_WORKSPACE_PREV,
+        CC_WORKSPACE_NEXT,
+        CC_TAB_PREV,
+        CC_TAB_NEXT,
+        CC_PANE_LEFT,
+        CC_PANE_DOWN,
+        CC_PANE_UP,
+        CC_PANE_RIGHT,
+        CC_AGENT_PICKER,
+        CC_SCRATCHPAD,
+        CC_WORKSPACE_NEW,
+        CC_TAB_NEW,
+        CC_LAZYGIT,
+        CC_PALETTE,
+        CC_PANE_ZOOM,
+        CC_HUNK,
+        CC_ACCEPT,
+        CC_REJECT,
+        CC_PROMPT,
+        CC_CLEAR,
     ):
         assert controller.handle(control, 127)
-    assert ("workspace", "focus", "w2") in commands
-    assert ("tab", "focus", "w1:t2") in commands
-    assert ("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump") in commands
-    assert ("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax") in commands
-    assert ("agent", "prompt", "w1:p1", "test prompt") in commands
-    assert ("agent", "send-keys", "w1:p1", "enter") in commands
-    assert ("agent", "send-keys", "w1:p1", "esc") in commands
-    assert ("agent", "send-keys", "w1:p1", "ctrl+c") in commands
+    expected_commands = [
+        ("workspace", "focus", "w2"),
+        ("tab", "focus", "w1:t2"),
+        ("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump"),
+        ("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax"),
+        ("workspace", "create", "--cwd", "/tmp/project", "--focus"),
+        ("tab", "create", "--workspace", "w1", "--cwd", "/tmp/project", "--focus"),
+        ("plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"),
+        ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
+        ("pane", "zoom", "w1:p1", "--toggle"),
+        ("plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"),
+        ("agent", "prompt", "w1:p1", "test prompt"),
+        ("agent", "send-keys", "w1:p1", "enter"),
+        ("agent", "send-keys", "w1:p1", "esc"),
+        ("agent", "send-keys", "w1:p1", "ctrl+c"),
+    ]
+    assert all(command in commands for command in expected_commands)
+
+    class ImmediateFuture:
+        def __init__(self, function, arguments):
+            try:
+                self.value = function(*arguments)
+                self.error = None
+            except Exception as error:
+                self.value = None
+                self.error = error
+
+        def result(self):
+            if self.error is not None:
+                raise self.error
+            return self.value
+
+        def add_done_callback(self, callback):
+            callback(self)
+
+    class ImmediateExecutor:
+        def submit(self, function, *arguments):
+            return ImmediateFuture(function, arguments)
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, _limit):
+            return b'{"answers":{"target":{"type":"choice","choice":"agent_0"}}}'
+
+    http_call = {}
+
+    def fake_open(request, timeout):
+        http_call.update(request=request, timeout=timeout)
+        return FakeHTTPResponse()
+
+    http_client = TypeSafeClient("secret", "jev-test", opener=fake_open)
+    http_answers = http_client.evaluate(
+        {"prompt": "test"},
+        {
+            "target": {
+                "type": "choice",
+                "instructions": "Choose",
+                "criteria": {"agent_0": "Test agent"},
+            }
+        },
+    )
+    assert http_answers["target"]["choice"] == "agent_0"
+    assert http_call["request"].get_header("Authorization") == "Bearer secret"
+    try:
+        request_payload = json.loads(http_call["request"].data)
+    except ValueError as error:
+        raise AssertionError("TypeSafe request is not JSON") from error
+    assert request_payload["model"] == "jev-test"
+    assert http_call["timeout"] == TYPESAFE_TIMEOUT_SECONDS
+
+    class FakeTypeSafeClient:
+        enabled = True
+
+        def __init__(self, noul=1.0, choice="agent_1", fail=False):
+            self.noul = noul
+            self.choice = choice
+            self.fail = fail
+
+        def evaluate(self, state, questions):
+            if self.fail:
+                raise BridgeError("test TypeSafe failure")
+            answers = {}
+            for question_id, question in questions.items():
+                if question["type"] == "choice":
+                    answers[question_id] = {
+                        "type": "choice",
+                        "choice": self.choice,
+                        "confidence": 0.99,
+                    }
+                elif question["type"] == "noul":
+                    answers[question_id] = {"type": "noul", "noul": self.noul}
+                else:
+                    pane_id = question["instructions"]["pane_id"]
+                    answers[question_id] = {
+                        "type": "score",
+                        "score": 3 if pane_id == "p5" else 0,
+                        "confidence": 0.99,
+                    }
+            return answers
+
+    smart = TypeSafeAutomation(
+        FakeTypeSafeClient(), command=fake_herdr, executor=ImmediateExecutor()
+    )
+    smart_controller = HerdrController(
+        tracker, command=fake_herdr, clipboard=lambda: "smart prompt", automation=smart
+    )
+    assert smart_controller.handle(CC_PROMPT, 127)
+    smart.poll(fake, tracker)
+    routed_command = ("agent", "prompt", "w2:p3", "smart prompt")
+    assert routed_command in commands
+
+    failed = TypeSafeAutomation(
+        FakeTypeSafeClient(fail=True), command=fake_herdr, executor=ImmediateExecutor()
+    )
+    failed_controller = HerdrController(
+        tracker,
+        command=fake_herdr,
+        clipboard=lambda: "fallback prompt",
+        automation=failed,
+    )
+    assert failed_controller.handle(CC_PROMPT, 127)
+    failed.poll(fake, tracker)
+    fallback_command = ("agent", "prompt", "w1:p1", "fallback prompt")
+    assert fallback_command in commands
+
+    unmatched = TypeSafeAutomation(
+        FakeTypeSafeClient(choice="no_match"),
+        command=fake_herdr,
+        executor=ImmediateExecutor(),
+    )
+    unmatched_controller = HerdrController(
+        tracker,
+        command=fake_herdr,
+        clipboard=lambda: "unmatched prompt",
+        automation=unmatched,
+    )
+    assert unmatched_controller.handle(CC_PROMPT, 127)
+    unmatched.poll(fake, tracker)
+    unmatched_command = ("agent", "prompt", "w1:p1", "unmatched prompt")
+    assert unmatched_command not in commands
+
+    quiet = TypeSafeAutomation(
+        FakeTypeSafeClient(noul=0.0),
+        command=fake_herdr,
+        executor=ImmediateExecutor(),
+    )
+    quiet_tracker = Tracker()
+    quiet_midi = FakeMidi()
+    working = [
+        {
+            "pane_id": "p1",
+            "agent_status": "working",
+            "state_change_seq": 1,
+            "title": "test",
+            "focused": False,
+        }
+    ]
+    quiet.publish(quiet_midi, quiet_tracker, working, notify=False)
+    done = [dict(working[0], agent_status="done", state_change_seq=2)]
+    quiet.publish(quiet_midi, quiet_tracker, done, notify=True)
+    state_count = sum(item[0] == CC_STATE for item in quiet_midi.sent if item != "hb")
+    quiet.poll(quiet_midi, quiet_tracker)
+    assert (
+        sum(item[0] == CC_STATE for item in quiet_midi.sent if item != "hb")
+        == state_count
+    )
+
+    failed_chime = TypeSafeAutomation(
+        FakeTypeSafeClient(fail=True),
+        command=fake_herdr,
+        executor=ImmediateExecutor(),
+    )
+    failed_chime_tracker = Tracker()
+    failed_chime_midi = FakeMidi()
+    failed_chime.publish(failed_chime_midi, failed_chime_tracker, working, notify=False)
+    failed_chime.publish(failed_chime_midi, failed_chime_tracker, done, notify=True)
+    failed_chime.poll(failed_chime_midi, failed_chime_tracker)
+    state_values = [
+        item[1]
+        for item in failed_chime_midi.sent
+        if item != "hb" and item[0] == CC_STATE
+    ]
+    assert state_values[-1] & (1 << 5)
+
+    blocked_tracker = Tracker()
+    blocked_midi = FakeMidi()
+    quiet.publish(blocked_midi, blocked_tracker, working, notify=False)
+    blocked = [dict(working[0], agent_status="blocked", state_change_seq=2)]
+    quiet.publish(blocked_midi, blocked_tracker, blocked, notify=True)
+    blocked_values = [
+        item[1] for item in blocked_midi.sent if item != "hb" and item[0] == CC_STATE
+    ]
+    assert blocked_values[-1] & (1 << 6)
+
+    ranked = TypeSafeAutomation(
+        FakeTypeSafeClient(), command=fake_herdr, executor=ImmediateExecutor()
+    )
+    ranked_tracker = Tracker()
+    ranked_midi = FakeMidi()
+    many = [
+        {
+            "pane_id": f"p{index}",
+            "agent_status": "idle",
+            "state_change_seq": index,
+            "title": f"task {index}",
+            "cwd": f"/{index}",
+        }
+        for index in range(1, 6)
+    ]
+    ranked.publish(ranked_midi, ranked_tracker, many, notify=False)
+    assert "p5" not in ranked_tracker.slots
+    ranked.poll(ranked_midi, ranked_tracker)
+    assert "p5" in ranked_tracker.slots and "p4" not in ranked_tracker.slots
 
     fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
     assert isinstance(fallback, FallbackMidiOut)
-    assert isinstance(fallback.targets[0], CoreMidiOut if sys.platform == "darwin" else AlsaMidiOut)
+    assert isinstance(
+        fallback.targets[0], CoreMidiOut if sys.platform == "darwin" else AlsaMidiOut
+    )
     assert isinstance(fallback.targets[1], RtMidiOut)
     print("self-test ok")
 

@@ -11,6 +11,10 @@ python=${HERDR_QMK_PYTHON:-python3}
 if [ -s "$config_dir/python" ]; then
   python=$(cat "$config_dir/python")
 fi
+if [ -z "${TYPESAFE_API_KEY:-}" ] && [ -s "$config_dir/typesafe-api-key" ]; then
+  TYPESAFE_API_KEY=$(cat "$config_dir/typesafe-api-key")
+  export TYPESAFE_API_KEY
+fi
 mkdir -p "$state_dir"
 
 running() {
