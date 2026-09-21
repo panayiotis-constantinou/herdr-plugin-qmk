@@ -11,19 +11,37 @@ import glob
 import json
 import os
 import re
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import time
 
-MIDI_CHANNEL = 0xBF
+MIDI_CHANNEL = 0xBE  # MIDI channel 15 (status channels are zero-based)
+CC_WORKSPACE_PREV = 100
+CC_WORKSPACE_NEXT = 101
+CC_TAB_PREV = 102
+CC_TAB_NEXT = 103
+CC_PANE_LEFT = 104
+CC_PANE_DOWN = 105
+CC_PANE_UP = 106
+CC_PANE_RIGHT = 107
+CC_AGENT_PICKER = 108
+CC_SCRATCHPAD = 109
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
+CC_ACCEPT = 124
+CC_REJECT = 125
+CC_PROMPT = 126
+CC_CLEAR = 127
 PROTOCOL = 1
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
+MIDI_POLL_SECONDS = 0.05
+COMMAND_TIMEOUT_SECONDS = 2.0
 MIDI_PACKET_DATA_SIZE = 256
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
@@ -62,16 +80,58 @@ class MidiOut:
     def send(self, control, value):
         raise NotImplementedError
 
+    def receive(self):
+        return []
+
     def close(self):
         pass
 
 
+class MidiParser:
+    """Parse a MIDI byte stream, including running status and realtime bytes."""
+
+    def __init__(self):
+        self.status = None
+        self.data = bytearray()
+        self.in_sysex = False
+
+    def feed(self, chunk):
+        messages = []
+        for byte in chunk:
+            if byte >= 0xF8:
+                continue
+            if self.in_sysex:
+                if byte == 0xF7:
+                    self.in_sysex = False
+                continue
+            if byte & 0x80:
+                self.data.clear()
+                if byte == 0xF0:
+                    self.in_sysex = True
+                    self.status = None
+                elif byte >= 0xF0:
+                    self.status = None
+                else:
+                    self.status = byte
+                continue
+            if self.status is None:
+                continue
+            self.data.append(byte)
+            length = 1 if self.status & 0xF0 in (0xC0, 0xD0) else 2
+            if len(self.data) == length:
+                if self.status & 0xF0 == 0xB0:
+                    messages.append((self.status, *self.data))
+                self.data.clear()
+        return messages
+
+
 class AlsaMidiOut(MidiOut):
-    """Write-side handle on the ALSA rawmidi node of a USB MIDI card."""
+    """Duplex handle on the ALSA rawmidi node of a USB MIDI card."""
 
     def __init__(self, name):
         super().__init__(name)
         self.fd = None
+        self.parser = MidiParser()
 
     def open(self):
         needle = self.name.lower()
@@ -98,8 +158,7 @@ class AlsaMidiOut(MidiOut):
             raise BridgeError(f"card {long_name!r} exposes no rawmidi device")
         fd = None
         try:
-            fd = os.open(nodes[0], os.O_WRONLY | os.O_NONBLOCK)
-            os.set_blocking(fd, True)
+            fd = os.open(nodes[0], os.O_RDWR | os.O_NONBLOCK)
             self.fd = fd
         except OSError as error:
             if fd is not None:
@@ -110,6 +169,7 @@ class AlsaMidiOut(MidiOut):
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        self.parser = MidiParser()
 
     def send(self, control, value):
         if self.fd is None:
@@ -117,6 +177,14 @@ class AlsaMidiOut(MidiOut):
         message = bytes((MIDI_CHANNEL, control, value))
         if os.write(self.fd, message) != len(message):
             raise BridgeError("incomplete MIDI write")
+
+    def receive(self):
+        if self.fd is None:
+            raise BridgeError("MIDI device is closed")
+        try:
+            return self.parser.feed(os.read(self.fd, 4096))
+        except BlockingIOError:
+            return []
 
 
 class CoreMidiOut(MidiOut):
@@ -262,47 +330,73 @@ class CoreMidiOut(MidiOut):
 
 
 class RtMidiOut(MidiOut):
-    """Send through a named CoreMIDI/ALSA sequencer destination via python-rtmidi."""
+    """Use a named CoreMIDI/ALSA sequencer port via python-rtmidi."""
 
     def __init__(self, name):
         super().__init__(name)
-        self.midi = None
+        self.midi_out = None
+        self.midi_in = None
         self.opened = False
 
     def open(self):
-        if self.midi is None:
+        if self.midi_out is None:
             try:
                 import rtmidi
             except ImportError as error:
                 raise BridgeError("rtmidi backend requires python-rtmidi") from error
-            self.midi = rtmidi.MidiOut()
+            self.midi_out = rtmidi.MidiOut()
+            self.midi_in = rtmidi.MidiIn()
 
-        ports = self.midi.get_ports()
-        match = next(
-            (index for index, port in enumerate(ports) if self.name.lower() in port.lower()),
+        output_ports = self.midi_out.get_ports()
+        input_ports = self.midi_in.get_ports()
+        output_match = next(
+            (index for index, port in enumerate(output_ports) if self.name.lower() in port.lower()),
             None,
         )
-        if match is None:
+        input_match = next(
+            (index for index, port in enumerate(input_ports) if self.name.lower() in port.lower()),
+            None,
+        )
+        if output_match is None or input_match is None:
             raise BridgeError(
-                f"no sequencer MIDI port matching {self.name!r}; available: "
-                + (", ".join(ports) or "none")
+                f"no duplex sequencer MIDI port matching {self.name!r}; "
+                f"outputs: {', '.join(output_ports) or 'none'}; "
+                f"inputs: {', '.join(input_ports) or 'none'}"
             )
         try:
-            self.midi.open_port(match)
+            self.midi_out.open_port(output_match)
+            self.midi_in.open_port(input_match)
+            self.midi_in.ignore_types(sysex=True, timing=True, active_sense=True)
         except Exception as error:
-            raise BridgeError(f"cannot open sequencer port {ports[match]!r}: {error}") from error
+            self.close()
+            raise BridgeError(f"cannot open sequencer port matching {self.name!r}: {error}") from error
         self.opened = True
 
     def close(self):
-        if self.midi is not None and self.opened:
-            self.midi.close_port()
-            self.midi = None
-            self.opened = False
+        if self.midi_out is not None:
+            self.midi_out.close_port()
+        if self.midi_in is not None:
+            self.midi_in.close_port()
+        self.midi_out = None
+        self.midi_in = None
+        self.opened = False
 
     def send(self, control, value):
-        if self.midi is None or not self.opened:
+        if self.midi_out is None or not self.opened:
             raise BridgeError("MIDI sequencer destination is closed")
-        self.midi.send_message([MIDI_CHANNEL, control, value])
+        self.midi_out.send_message([MIDI_CHANNEL, control, value])
+
+    def receive(self):
+        if self.midi_in is None or not self.opened:
+            raise BridgeError("MIDI sequencer source is closed")
+        messages = []
+        while True:
+            event = self.midi_in.get_message()
+            if event is None:
+                return messages
+            message, _delta = event
+            if len(message) == 3 and message[0] & 0xF0 == 0xB0:
+                messages.append(tuple(message))
 
 
 class FallbackMidiOut(MidiOut):
@@ -335,6 +429,11 @@ class FallbackMidiOut(MidiOut):
             raise BridgeError("all MIDI destinations are closed")
         self.active.send(control, value)
 
+    def receive(self):
+        if self.active is None:
+            raise BridgeError("all MIDI destinations are closed")
+        return self.active.receive()
+
 
 def make_midi_out(name):
     if "|" in name:
@@ -350,6 +449,134 @@ def make_midi_out(name):
     if sys.platform == "darwin":
         return CoreMidiOut(name)
     return AlsaMidiOut(name)
+
+
+def run_herdr(*args):
+    try:
+        process = subprocess.run(
+            ["herdr", *args], capture_output=True, text=True, check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError(f"herdr {' '.join(args)} timed out") from error
+    if process.returncode:
+        message = process.stderr.strip() or process.stdout.strip() or "unknown error"
+        raise BridgeError(f"herdr {' '.join(args)} failed: {message}")
+    try:
+        response = json.loads(process.stdout)
+        return response["result"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise BridgeError(f"malformed herdr response: {error}") from error
+
+
+def read_clipboard():
+    commands = [
+        ("wl-paste", "--no-newline"),
+        ("xclip", "-selection", "clipboard", "-o"),
+        ("pbpaste",),
+    ]
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            process = subprocess.run(
+                command, capture_output=True, text=True, check=False,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if process.returncode == 0 and process.stdout.strip():
+            return process.stdout.rstrip("\x00")
+    raise BridgeError("prompt requires non-empty clipboard text")
+
+
+class HerdrController:
+    def __init__(self, tracker, command=run_herdr, clipboard=read_clipboard):
+        self.tracker = tracker
+        self.command = command
+        self.clipboard = clipboard
+
+    def _focused_workspace(self):
+        workspaces = self.command("workspace", "list")["workspaces"]
+        return next((item for item in workspaces if item.get("focused")), None)
+
+    def _focused_pane(self):
+        workspace = self._focused_workspace()
+        if workspace is None:
+            raise BridgeError("Herdr has no focused workspace")
+        panes = self.command("pane", "list", "--workspace", workspace["workspace_id"])["panes"]
+        pane = next((item for item in panes if item.get("focused")), None)
+        if pane is None:
+            raise BridgeError("Herdr has no focused pane")
+        return pane
+
+    def _cycle(self, kind, key, delta, workspace=None):
+        args = [kind, "list"]
+        if workspace is not None:
+            args += ["--workspace", workspace]
+        items = sorted(self.command(*args)[f"{kind}s"], key=lambda item: item["number"])
+        if not items:
+            raise BridgeError(f"Herdr has no {kind}s")
+        current = next((index for index, item in enumerate(items) if item.get("focused")), None)
+        if current is None:
+            raise BridgeError(f"Herdr has no focused {kind}")
+        target = items[(current + delta) % len(items)][key]
+        self.command(kind, "focus", target)
+
+    def handle(self, control, value):
+        if value != 127:
+            return False
+        if control in (CC_WORKSPACE_PREV, CC_WORKSPACE_NEXT):
+            self._cycle(
+                "workspace",
+                "workspace_id",
+                -1 if control == CC_WORKSPACE_PREV else 1,
+            )
+        elif control in (CC_TAB_PREV, CC_TAB_NEXT):
+            workspace = self._focused_workspace()
+            if workspace is None:
+                raise BridgeError("Herdr has no focused workspace")
+            self._cycle(
+                "tab",
+                "tab_id",
+                -1 if control == CC_TAB_PREV else 1,
+                workspace["workspace_id"],
+            )
+        elif CC_PANE_LEFT <= control <= CC_PANE_RIGHT:
+            directions = {
+                CC_PANE_LEFT: "left",
+                CC_PANE_DOWN: "down",
+                CC_PANE_UP: "up",
+                CC_PANE_RIGHT: "right",
+            }
+            pane = self._focused_pane()
+            self.command(
+                "pane", "focus", "--direction", directions[control], "--pane", pane["pane_id"]
+            )
+        elif control == CC_AGENT_PICKER:
+            self.command("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump")
+        elif control == CC_SCRATCHPAD:
+            self.command("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax")
+        elif control in (CC_ACCEPT, CC_REJECT, CC_CLEAR):
+            keys = {CC_ACCEPT: "enter", CC_REJECT: "esc", CC_CLEAR: "ctrl+c"}
+            self.command("agent", "send-keys", self._focused_pane()["pane_id"], keys[control])
+        elif control == CC_PROMPT:
+            self.command(
+                "agent", "prompt", self._focused_pane()["pane_id"], self.clipboard()
+            )
+        else:
+            return False
+        return True
+
+    def poll(self, midi):
+        for status, control, value in midi.receive():
+            if status != MIDI_CHANNEL:
+                continue
+            try:
+                if self.handle(control, value):
+                    log(f"control CC {control}")
+            except Exception as error:
+                log(f"control CC {control} failed: {error}")
 
 
 class Tracker:
@@ -453,7 +680,7 @@ def subscription_request(agents):
     ).encode()
 
 
-def watch_session(socket_path, midi, tracker):
+def watch_session(socket_path, midi, tracker, controller):
     initial = snapshot(socket_path)
     subscribed = {a["pane_id"] for a in initial}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -478,10 +705,13 @@ def watch_session(socket_path, midi, tracker):
         agents = snapshot(socket_path)
         changed = {a["pane_id"] for a in agents} != subscribed
         tracker.send_frame(midi, tracker.update(agents, notify=False))
+        last_heartbeat = time.monotonic()
         if changed:
             raise BridgeError("Herdr agent set changed; resubscribing")
 
+        sock.settimeout(MIDI_POLL_SECONDS)
         while True:
+            controller.poll(midi)
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
                 if not line.strip():
@@ -489,12 +719,15 @@ def watch_session(socket_path, midi, tracker):
                 agents = snapshot(socket_path)
                 changed = {a["pane_id"] for a in agents} != subscribed
                 tracker.send_frame(midi, tracker.update(agents, notify=True))
+                last_heartbeat = time.monotonic()
                 if changed:
                     raise BridgeError("Herdr agent set changed; resubscribing")
             try:
                 chunk = sock.recv(4096)
             except socket.timeout:
-                midi.heartbeat()
+                if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
+                    midi.heartbeat()
+                    last_heartbeat = time.monotonic()
                 continue
             if not chunk:
                 raise BridgeError("Herdr event stream closed")
@@ -504,6 +737,7 @@ def watch_session(socket_path, midi, tracker):
 def run(socket_path, port_name):
     midi = make_midi_out(port_name)
     tracker = Tracker()
+    controller = HerdrController(tracker)
     last_error = None
     midi_unavailable = True
     while True:
@@ -514,7 +748,7 @@ def run(socket_path, port_name):
             if midi_unavailable:
                 log(f"connected to MIDI matching {port_name!r}")
             midi_unavailable = False
-            watch_session(socket_path, midi, tracker)
+            watch_session(socket_path, midi, tracker, controller)
         except Exception as error:  # any failure becomes a logged retry, never a dead daemon
             midi.close()
             if not opened:
@@ -562,6 +796,19 @@ def self_test():
     assert request.count(b'"type"') == 4
     assert b'"pane_id": "w1:p1"' in request
 
+    parser = MidiParser()
+    assert parser.feed((MIDI_CHANNEL, CC_WORKSPACE_PREV)) == []
+    assert parser.feed((0xF8, 127, CC_WORKSPACE_NEXT, 127)) == [
+        (MIDI_CHANNEL, CC_WORKSPACE_PREV, 127),
+        (MIDI_CHANNEL, CC_WORKSPACE_NEXT, 127),
+    ]
+    assert parser.feed((0xF0, 1, 2, 0xF7, MIDI_CHANNEL, CC_ACCEPT, 127)) == [
+        (MIDI_CHANNEL, CC_ACCEPT, 127)
+    ]
+    assert parser.feed((0xF1, 1, MIDI_CHANNEL, CC_REJECT, 127)) == [
+        (MIDI_CHANNEL, CC_REJECT, 127)
+    ]
+
     expected = [MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]
     packet_list = build_packet_list(expected)
     num_packets, stamp, length = struct.unpack_from("<IQH", packet_list, 0)
@@ -591,7 +838,7 @@ def self_test():
     expected_state = (CC_STATE, value)
     assert fake.sent[-1] == expected_state, fake.sent[-1]
 
-    class FakeRtMidi:
+    class FakeRtMidiOut:
         instances = []
 
         def __init__(self):
@@ -612,20 +859,48 @@ def self_test():
         def close_port(self):
             self.closed = True
 
+    class FakeRtMidiIn:
+        instances = []
+
+        def __init__(self):
+            self.opened = None
+            self.events = [([MIDI_CHANNEL, CC_ACCEPT, 127], 0.0)]
+            self.closed = False
+            self.instances.append(self)
+
+        def get_ports(self):
+            return ["unrelated", "qmk-herdr-ipad"]
+
+        def open_port(self, index):
+            self.opened = index
+
+        def ignore_types(self, **kwargs):
+            pass
+
+        def get_message(self):
+            return self.events.pop(0) if self.events else None
+
+        def close_port(self):
+            self.closed = True
+
     previous_rtmidi = sys.modules.get("rtmidi")
-    sys.modules["rtmidi"] = type("FakeRtMidiModule", (), {"MidiOut": FakeRtMidi})
+    sys.modules["rtmidi"] = type(
+        "FakeRtMidiModule", (), {"MidiOut": FakeRtMidiOut, "MidiIn": FakeRtMidiIn}
+    )
     try:
         output = make_midi_out("rtmidi:HERDR-IPAD")
         output.open()
         output.send(CC_HEARTBEAT, PROTOCOL)
+        assert output.receive() == [(MIDI_CHANNEL, CC_ACCEPT, 127)]
         output.close()
-        instance = FakeRtMidi.instances[-1]
-        assert instance.opened == 1
-        assert instance.sent == [[MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]]
-        assert instance.closed
+        output_instance = FakeRtMidiOut.instances[-1]
+        input_instance = FakeRtMidiIn.instances[-1]
+        assert output_instance.opened == 1 and input_instance.opened == 1
+        assert output_instance.sent == [[MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]]
+        assert output_instance.closed and input_instance.closed
 
         missing = make_midi_out("rtmidi:missing")
-        before = len(FakeRtMidi.instances)
+        before = len(FakeRtMidiOut.instances)
         for _ in range(2):
             try:
                 missing.open()
@@ -633,12 +908,50 @@ def self_test():
                 pass
             else:
                 raise AssertionError("missing RtMidi port opened")
-        assert len(FakeRtMidi.instances) == before + 1
+        assert len(FakeRtMidiOut.instances) == before + 1
     finally:
         if previous_rtmidi is None:
             del sys.modules["rtmidi"]
         else:
             sys.modules["rtmidi"] = previous_rtmidi
+
+    commands = []
+
+    def fake_herdr(*args):
+        if args == ("workspace", "list"):
+            return {"workspaces": [
+                {"workspace_id": "w1", "number": 1, "focused": True},
+                {"workspace_id": "w2", "number": 2, "focused": False},
+            ]}
+        if args == ("tab", "list", "--workspace", "w1"):
+            return {"tabs": [
+                {"tab_id": "w1:t1", "number": 1, "focused": True},
+                {"tab_id": "w1:t2", "number": 2, "focused": False},
+            ]}
+        if args == ("pane", "list", "--workspace", "w1"):
+            return {"panes": [{"pane_id": "w1:p1", "focused": True}]}
+        if args == ("agent", "list"):
+            return {"agents": [{"pane_id": "w1:p1"}, {"pane_id": "w2:p3"}]}
+        commands.append(args)
+        return {}
+
+    tracker.slots = ["w1:p2", None, None, None]
+    controller = HerdrController(tracker, command=fake_herdr, clipboard=lambda: "test prompt")
+    assert not controller.handle(CC_ACCEPT, 0)
+    for control in (
+        CC_WORKSPACE_PREV, CC_WORKSPACE_NEXT, CC_TAB_PREV, CC_TAB_NEXT,
+        CC_PANE_LEFT, CC_PANE_DOWN, CC_PANE_UP, CC_PANE_RIGHT,
+        CC_AGENT_PICKER, CC_SCRATCHPAD, CC_ACCEPT, CC_REJECT, CC_PROMPT, CC_CLEAR,
+    ):
+        assert controller.handle(control, 127)
+    assert ("workspace", "focus", "w2") in commands
+    assert ("tab", "focus", "w1:t2") in commands
+    assert ("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump") in commands
+    assert ("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax") in commands
+    assert ("agent", "prompt", "w1:p1", "test prompt") in commands
+    assert ("agent", "send-keys", "w1:p1", "enter") in commands
+    assert ("agent", "send-keys", "w1:p1", "esc") in commands
+    assert ("agent", "send-keys", "w1:p1", "ctrl+c") in commands
 
     fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
     assert isinstance(fallback, FallbackMidiOut)
@@ -655,7 +968,7 @@ def main():
     if not socket_path:
         log("HERDR_SOCKET_PATH is missing; run qmk-herdr inside a Herdr pane")
         sys.exit(1)
-    run(socket_path, sys.argv[1] if len(sys.argv) > 1 else "Planck EZ")
+    run(socket_path, sys.argv[1] if len(sys.argv) > 1 else "Moonlander|Planck EZ")
 
 
 if __name__ == "__main__":
