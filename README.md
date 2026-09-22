@@ -98,6 +98,7 @@ The bridge uses MIDI channel 15 and dispatches only CC value `127`:
 | 119 | Open the plugin command palette |
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
+| 122 | Focus the next live agent in Herdr's agent-list order, wrapping |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
 | 126 | Submit clipboard text to the TypeSafe-selected agent, or the focused agent without TypeSafe |

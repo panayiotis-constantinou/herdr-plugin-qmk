@@ -43,6 +43,7 @@ CC_LAZYGIT = 118
 CC_PALETTE = 119
 CC_PANE_ZOOM = 120
 CC_HUNK = 121
+CC_AGENT_NEXT = 122
 CC_ACCEPT = 124
 CC_REJECT = 125
 CC_PROMPT = 126
@@ -985,6 +986,14 @@ class HerdrController:
             self.command(
                 "plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"
             )
+        elif control == CC_AGENT_NEXT:
+            agents = self.command("agent", "list")["agents"]
+            if not agents:
+                raise BridgeError("Herdr has no live agents")
+            panes = [agent["pane_id"] for agent in agents]
+            focused = self._focused_pane()["pane_id"]
+            current = panes.index(focused) if focused in panes else -1
+            self.command("agent", "focus", panes[(current + 1) % len(panes)])
         elif control in (CC_ACCEPT, CC_REJECT, CC_CLEAR):
             keys = {CC_ACCEPT: "enter", CC_REJECT: "esc", CC_CLEAR: "ctrl+c"}
             self.command(
@@ -1419,6 +1428,7 @@ def self_test():
         CC_PALETTE,
         CC_PANE_ZOOM,
         CC_HUNK,
+        CC_AGENT_NEXT,
         CC_ACCEPT,
         CC_REJECT,
         CC_PROMPT,
@@ -1436,6 +1446,7 @@ def self_test():
         ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
         ("pane", "zoom", "w1:p1", "--toggle"),
         ("plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"),
+        ("agent", "focus", "w2:p3"),
         ("agent", "prompt", "w1:p1", "test prompt"),
         ("agent", "send-keys", "w1:p1", "enter"),
         ("agent", "send-keys", "w1:p1", "esc"),
