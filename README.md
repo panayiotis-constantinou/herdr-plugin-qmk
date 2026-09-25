@@ -43,11 +43,11 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 
 `TYPESAFE_MODEL` optionally overrides the default `jev-latest` model. When enabled, TypeSafe runs bounded typed judgments in background threads:
 
-- **Choice** routes CC 126 clipboard prompts to the most relevant live agent; low-confidence or failed requests fall back to the focused agent, while an explicit no-match leaves the clipboard unsent.
+- **Choice** routes note 126 clipboard prompts to the most relevant live agent; low-confidence or failed requests fall back to the focused agent, while an explicit no-match leaves the clipboard unsent.
 - **Choice** caches implementation, review, research, planning, operations, documentation, or general role tags when agent metadata changes. Roles improve routing and attention ranking but never alter agent state.
-- **Choice** makes CC 123 select one safe action from prompting or focusing an existing agent, opening the agent picker, Hunk, or LazyGit, and doing nothing. Missing, failed, or low-confidence judgments open the command palette instead.
+- **Choice** makes note 123 select one safe action from prompting or focusing an existing agent, opening the agent picker, Hunk, or LazyGit, and doing nothing. Missing, failed, or low-confidence judgments open the command palette instead.
 - **Noul** batches nearby completed-agent transitions and decides whether one sound is useful. Blocked-agent sounds remain deterministic and immediate.
-- **Score** maintains an attention order from agent task metadata. It breaks same-status LED-slot ties and makes CC 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
+- **Score** maintains an attention order from agent task metadata. It breaks same-status LED-slot ties and makes note 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
 
 Requests may include up to 4,000 characters of clipboard text plus agent metadata such as pane ID, project path, title, status, and workspace label. Terminal scrollback and agent conversations are not sent. Without an API key, or when ranking fails, existing local behavior continues; prompt and completion-chime failures use the deterministic fallback after the two-second request timeout.
 
@@ -63,7 +63,7 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 2. In the free **midimittr** app, route `Network Session 1` → Planck EZ for LEDs and Planck EZ → `Network Session 1` for controls. Do not route either endpoint back to itself; midimittr advertises background operation.
 3. Keep Tailscale connected. RTP-MIDI is unencrypted and uses adjacent UDP control/data ports `5004` and `5005`, so restrict both to the intended peer. Configure `rtmidi:` with the per-peer sequencer port name exposed by rtpmidid.
 
-Flash the matching QMK firmware: its Herdr layer sends CC 100–109 and 116–127 on channel 15 instead of F13–F24. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
+Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–109 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
 
@@ -85,9 +85,9 @@ The process log is `qmk-herdr.log` under `HERDR_PLUGIN_STATE_DIR`; Herdr exposes
 
 ## Keyboard controls
 
-The bridge uses MIDI channel 15 and dispatches only CC value `127`:
+The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note Off is ignored. Notes avoid CC 100/101 (RPN select) and CC 120–127 (channel mode messages), which MIDI routers may filter or act on. Status still goes to the keyboard as CC 110–115.
 
-| CC | Action |
+| Note | Action |
 | ---: | --- |
 | 100–101 | Focus previous/next workspace, wrapping by displayed number |
 | 102–103 | Focus previous/next tab in the focused workspace, wrapping by displayed number |
@@ -117,7 +117,7 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 - Planck EZ bottom-center LED: red disconnected, amber blocked, blue working, green done, dim white idle, purple unknown/overflow.
 - Four Planck EZ outer-bottom LEDs: stable status-prioritized slots; TypeSafe can rank same-status agents by attention value.
 - Caps Lock, Scroll Lock, and mouse-jiggler indicators return when the spinner is idle.
-- The Planck EZ speaker always cues connection and blocked transitions; TypeSafe can suppress low-value done cues.
+- The keyboard speaker always cues connection and blocked transitions; TypeSafe can suppress low-value done cues.
 
 The keyboard stops the working animation if bridge heartbeats time out.
 

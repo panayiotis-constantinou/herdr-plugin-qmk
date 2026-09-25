@@ -23,33 +23,35 @@ import types
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-MIDI_CHANNEL = 0xBE  # MIDI channel 15 (status channels are zero-based)
-CC_WORKSPACE_PREV = 100
-CC_WORKSPACE_NEXT = 101
-CC_TAB_PREV = 102
-CC_TAB_NEXT = 103
-CC_PANE_LEFT = 104
-CC_PANE_DOWN = 105
-CC_PANE_UP = 106
-CC_PANE_RIGHT = 107
-CC_AGENT_PICKER = 108
-CC_SCRATCHPAD = 109
+MIDI_CHANNEL = 0xBE  # CC on MIDI channel 15 (status channels are zero-based)
+NOTE_ON = 0x9E  # keyboard controls arrive as notes: CC 100/101 and 120-127 are reserved
+NOTE_OFF = 0x8E
+NOTE_WORKSPACE_PREV = 100
+NOTE_WORKSPACE_NEXT = 101
+NOTE_TAB_PREV = 102
+NOTE_TAB_NEXT = 103
+NOTE_PANE_LEFT = 104
+NOTE_PANE_DOWN = 105
+NOTE_PANE_UP = 106
+NOTE_PANE_RIGHT = 107
+NOTE_AGENT_PICKER = 108
+NOTE_SCRATCHPAD = 109
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
-CC_WORKSPACE_NEW = 116
-CC_TAB_NEW = 117
-CC_LAZYGIT = 118
-CC_PALETTE = 119
-CC_PANE_ZOOM = 120
-CC_HUNK = 121
-CC_AGENT_NEXT = 122
-CC_SMART_ACTION = 123
-CC_ACCEPT = 124
-CC_REJECT = 125
-CC_PROMPT = 126
-CC_CLEAR = 127
-PROTOCOL = 1
+NOTE_WORKSPACE_NEW = 116
+NOTE_TAB_NEW = 117
+NOTE_LAZYGIT = 118
+NOTE_PALETTE = 119
+NOTE_PANE_ZOOM = 120
+NOTE_HUNK = 121
+NOTE_AGENT_NEXT = 122
+NOTE_SMART_ACTION = 123
+NOTE_ACCEPT = 124
+NOTE_REJECT = 125
+NOTE_PROMPT = 126
+NOTE_CLEAR = 127
+PROTOCOL = 2
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
@@ -149,7 +151,7 @@ class MidiParser:
             self.data.append(byte)
             length = 1 if self.status & 0xF0 in (0xC0, 0xD0) else 2
             if len(self.data) == length:
-                if self.status & 0xF0 == 0xB0:
+                if self.status & 0xF0 in (0x80, 0x90, 0xB0):
                     messages.append((self.status, *self.data))
                 self.data.clear()
         return messages
@@ -368,7 +370,7 @@ class RtMidiOut(MidiOut):
         self.opened = False
 
     def open(self):
-        if self.midi_out is None:
+        if self.midi_out is None or self.midi_in is None:
             try:
                 import rtmidi  # type: ignore[import-not-found]
             except ImportError as error:
@@ -420,8 +422,7 @@ class RtMidiOut(MidiOut):
             self.midi_out.close_port()
         if self.midi_in is not None:
             self.midi_in.close_port()
-        self.midi_out = None
-        self.midi_in = None
+        # RtMidi keeps its ALSA client until destruction; reuse it on retries.
         self.opened = False
 
     def send(self, control, value):
@@ -438,7 +439,7 @@ class RtMidiOut(MidiOut):
             if event is None:
                 return messages
             message, _delta = event
-            if len(message) == 3 and message[0] & 0xF0 == 0xB0:
+            if len(message) == 3 and message[0] & 0xF0 in (0x80, 0x90, 0xB0):
                 messages.append(tuple(message))
 
 
@@ -1198,28 +1199,28 @@ class HerdrController:
     def handle(self, control, value):
         if value != 127:
             return False
-        if control in (CC_WORKSPACE_PREV, CC_WORKSPACE_NEXT):
+        if control in (NOTE_WORKSPACE_PREV, NOTE_WORKSPACE_NEXT):
             self._cycle(
                 "workspace",
                 "workspace_id",
-                -1 if control == CC_WORKSPACE_PREV else 1,
+                -1 if control == NOTE_WORKSPACE_PREV else 1,
             )
-        elif control in (CC_TAB_PREV, CC_TAB_NEXT):
+        elif control in (NOTE_TAB_PREV, NOTE_TAB_NEXT):
             workspace = self._focused_workspace()
             if workspace is None:
                 raise BridgeError("Herdr has no focused workspace")
             self._cycle(
                 "tab",
                 "tab_id",
-                -1 if control == CC_TAB_PREV else 1,
+                -1 if control == NOTE_TAB_PREV else 1,
                 workspace["workspace_id"],
             )
-        elif CC_PANE_LEFT <= control <= CC_PANE_RIGHT:
+        elif NOTE_PANE_LEFT <= control <= NOTE_PANE_RIGHT:
             directions = {
-                CC_PANE_LEFT: "left",
-                CC_PANE_DOWN: "down",
-                CC_PANE_UP: "up",
-                CC_PANE_RIGHT: "right",
+                NOTE_PANE_LEFT: "left",
+                NOTE_PANE_DOWN: "down",
+                NOTE_PANE_UP: "up",
+                NOTE_PANE_RIGHT: "right",
             }
             pane = self._focused_pane()
             self.command(
@@ -1230,18 +1231,18 @@ class HerdrController:
                 "--pane",
                 pane["pane_id"],
             )
-        elif control == CC_AGENT_PICKER:
+        elif control == NOTE_AGENT_PICKER:
             self.command(
                 "plugin", "action", "invoke", "open", "--plugin", "lancodev.jump"
             )
-        elif control == CC_SCRATCHPAD:
+        elif control == NOTE_SCRATCHPAD:
             self.command(
                 "plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax"
             )
-        elif control == CC_WORKSPACE_NEW:
+        elif control == NOTE_WORKSPACE_NEW:
             pane = self._focused_pane()
             self.command("workspace", "create", "--cwd", pane["cwd"], "--focus")
-        elif control == CC_TAB_NEW:
+        elif control == NOTE_TAB_NEW:
             pane = self._focused_pane()
             self.command(
                 "tab",
@@ -1252,21 +1253,21 @@ class HerdrController:
                 pane["cwd"],
                 "--focus",
             )
-        elif control == CC_LAZYGIT:
+        elif control == NOTE_LAZYGIT:
             self.command(
                 "plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"
             )
-        elif control == CC_PALETTE:
+        elif control == NOTE_PALETTE:
             self.command(
                 "plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"
             )
-        elif control == CC_PANE_ZOOM:
+        elif control == NOTE_PANE_ZOOM:
             self.command("pane", "zoom", self._focused_pane()["pane_id"], "--toggle")
-        elif control == CC_HUNK:
+        elif control == NOTE_HUNK:
             self.command(
                 "plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"
             )
-        elif control == CC_AGENT_NEXT:
+        elif control == NOTE_AGENT_NEXT:
             agents = self.command("agent", "list")["agents"]
             if not agents:
                 raise BridgeError("Herdr has no live agents")
@@ -1278,7 +1279,7 @@ class HerdrController:
             focused = self._focused_pane()["pane_id"]
             current = panes.index(focused) if focused in panes else -1
             self.command("agent", "focus", panes[(current + 1) % len(panes)])
-        elif control == CC_SMART_ACTION:
+        elif control == NOTE_SMART_ACTION:
             pane_id = self._focused_pane()["pane_id"]
             try:
                 clipboard = self.clipboard()
@@ -1297,12 +1298,12 @@ class HerdrController:
                     "--plugin",
                     "jt.command-palette",
                 )
-        elif control in (CC_ACCEPT, CC_REJECT, CC_CLEAR):
-            keys = {CC_ACCEPT: "enter", CC_REJECT: "esc", CC_CLEAR: "ctrl+c"}
+        elif control in (NOTE_ACCEPT, NOTE_REJECT, NOTE_CLEAR):
+            keys = {NOTE_ACCEPT: "enter", NOTE_REJECT: "esc", NOTE_CLEAR: "ctrl+c"}
             self.command(
                 "agent", "send-keys", self._focused_pane()["pane_id"], keys[control]
             )
-        elif control == CC_PROMPT:
+        elif control == NOTE_PROMPT:
             pane_id = self._focused_pane()["pane_id"]
             prompt = self.clipboard()
             if self.automation is None or not self.automation.route_prompt(
@@ -1315,13 +1316,15 @@ class HerdrController:
 
     def poll(self, midi):
         for status, control, value in midi.receive():
-            if status != MIDI_CHANNEL:
+            if status == NOTE_OFF:
+                value = 0
+            elif status != NOTE_ON:
                 continue
             try:
                 if self.handle(control, value):
-                    log(f"control CC {control}")
+                    log(f"control note {control}")
             except Exception as error:
-                log(f"control CC {control} failed: {error}")
+                log(f"control note {control} failed: {error}")
 
 
 class Tracker:
@@ -1546,19 +1549,22 @@ def self_test():
     assert b'"pane_id": "w1:p1"' in request
 
     parser = MidiParser()
-    parsed = parser.feed((MIDI_CHANNEL, CC_WORKSPACE_PREV))
+    parsed = parser.feed((NOTE_ON, NOTE_WORKSPACE_PREV))
     assert parsed == []
-    parsed = parser.feed((0xF8, 127, CC_WORKSPACE_NEXT, 127))
+    parsed = parser.feed((0xF8, 127, NOTE_WORKSPACE_NEXT, 127))
     expected_messages = [
-        (MIDI_CHANNEL, CC_WORKSPACE_PREV, 127),
-        (MIDI_CHANNEL, CC_WORKSPACE_NEXT, 127),
+        (NOTE_ON, NOTE_WORKSPACE_PREV, 127),
+        (NOTE_ON, NOTE_WORKSPACE_NEXT, 127),
     ]
     assert parsed == expected_messages
-    parsed = parser.feed((0xF0, 1, 2, 0xF7, MIDI_CHANNEL, CC_ACCEPT, 127))
-    expected_messages = [(MIDI_CHANNEL, CC_ACCEPT, 127)]
+    parsed = parser.feed((0xF0, 1, 2, 0xF7, NOTE_ON, NOTE_ACCEPT, 127))
+    expected_messages = [(NOTE_ON, NOTE_ACCEPT, 127)]
     assert parsed == expected_messages
-    parsed = parser.feed((0xF1, 1, MIDI_CHANNEL, CC_REJECT, 127))
-    expected_messages = [(MIDI_CHANNEL, CC_REJECT, 127)]
+    parsed = parser.feed((0xF1, 1, NOTE_ON, NOTE_REJECT, 127))
+    expected_messages = [(NOTE_ON, NOTE_REJECT, 127)]
+    assert parsed == expected_messages
+    parsed = parser.feed((NOTE_OFF, NOTE_REJECT, 0, MIDI_CHANNEL, CC_STATE, 1))
+    expected_messages = [(NOTE_OFF, NOTE_REJECT, 0), (MIDI_CHANNEL, CC_STATE, 1)]
     assert parsed == expected_messages
 
     expected = [MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]
@@ -1596,6 +1602,8 @@ def self_test():
     expected_state = (CC_STATE, value)
     assert fake.sent[-1] == expected_state, fake.sent[-1]
 
+    ports_available = [True]
+
     class FakeRtMidiOut:
         instances = []
 
@@ -1606,7 +1614,7 @@ def self_test():
             self.instances.append(self)
 
         def get_ports(self):
-            return ["unrelated", "qmk-herdr-ipad"]
+            return ["unrelated"] + (["qmk-herdr-ipad"] if ports_available[0] else [])
 
         def open_port(self, index):
             self.opened = index
@@ -1622,12 +1630,12 @@ def self_test():
 
         def __init__(self):
             self.opened = None
-            self.events = [([MIDI_CHANNEL, CC_ACCEPT, 127], 0.0)]
+            self.events = [([NOTE_ON, NOTE_ACCEPT, 127], 0.0)]
             self.closed = False
             self.instances.append(self)
 
         def get_ports(self):
-            return ["unrelated", "qmk-herdr-ipad"]
+            return ["unrelated"] + (["qmk-herdr-ipad"] if ports_available[0] else [])
 
         def open_port(self, index):
             self.opened = index
@@ -1651,7 +1659,7 @@ def self_test():
         output.open()
         output.send(CC_HEARTBEAT, PROTOCOL)
         received = output.receive()
-        expected_messages = [(MIDI_CHANNEL, CC_ACCEPT, 127)]
+        expected_messages = [(NOTE_ON, NOTE_ACCEPT, 127)]
         assert received == expected_messages
         output.close()
         output_instance = FakeRtMidiOut.instances[-1]
@@ -1660,16 +1668,21 @@ def self_test():
         assert output_instance.sent == [[MIDI_CHANNEL, CC_HEARTBEAT, PROTOCOL]]
         assert output_instance.closed and input_instance.closed
 
-        missing = make_midi_out("rtmidi:missing")
+        ports_available[0] = False
+        missing = make_midi_out("rtmidi:qmk-herdr-ipad")
         before = len(FakeRtMidiOut.instances)
-        for _ in range(2):
+        for _ in range(3):
             try:
                 missing.open()
             except BridgeError:
-                pass
+                missing.close()
             else:
                 raise AssertionError("missing RtMidi port opened")
         assert len(FakeRtMidiOut.instances) == before + 1
+        ports_available[0] = True
+        missing.open()
+        assert missing.midi_out is FakeRtMidiOut.instances[-1]
+        missing.close()
     finally:
         if previous_rtmidi is None:
             del sys.modules["rtmidi"]
@@ -1713,30 +1726,30 @@ def self_test():
     controller = HerdrController(
         tracker, command=fake_herdr, clipboard=lambda: "test prompt"
     )
-    assert not controller.handle(CC_ACCEPT, 0)
+    assert not controller.handle(NOTE_ACCEPT, 0)
     for control in (
-        CC_WORKSPACE_PREV,
-        CC_WORKSPACE_NEXT,
-        CC_TAB_PREV,
-        CC_TAB_NEXT,
-        CC_PANE_LEFT,
-        CC_PANE_DOWN,
-        CC_PANE_UP,
-        CC_PANE_RIGHT,
-        CC_AGENT_PICKER,
-        CC_SCRATCHPAD,
-        CC_WORKSPACE_NEW,
-        CC_TAB_NEW,
-        CC_LAZYGIT,
-        CC_PALETTE,
-        CC_PANE_ZOOM,
-        CC_HUNK,
-        CC_AGENT_NEXT,
-        CC_SMART_ACTION,
-        CC_ACCEPT,
-        CC_REJECT,
-        CC_PROMPT,
-        CC_CLEAR,
+        NOTE_WORKSPACE_PREV,
+        NOTE_WORKSPACE_NEXT,
+        NOTE_TAB_PREV,
+        NOTE_TAB_NEXT,
+        NOTE_PANE_LEFT,
+        NOTE_PANE_DOWN,
+        NOTE_PANE_UP,
+        NOTE_PANE_RIGHT,
+        NOTE_AGENT_PICKER,
+        NOTE_SCRATCHPAD,
+        NOTE_WORKSPACE_NEW,
+        NOTE_TAB_NEW,
+        NOTE_LAZYGIT,
+        NOTE_PALETTE,
+        NOTE_PANE_ZOOM,
+        NOTE_HUNK,
+        NOTE_AGENT_NEXT,
+        NOTE_SMART_ACTION,
+        NOTE_ACCEPT,
+        NOTE_REJECT,
+        NOTE_PROMPT,
+        NOTE_CLEAR,
     ):
         assert controller.handle(control, 127)
     expected_commands = [
@@ -1757,6 +1770,18 @@ def self_test():
         ("agent", "send-keys", "w1:p1", "ctrl+c"),
     ]
     assert all(command in commands for command in expected_commands)
+
+    class FakeControlMidi:
+        def receive(self):
+            return [
+                (MIDI_CHANNEL, NOTE_ACCEPT, 127),
+                (NOTE_OFF, NOTE_ACCEPT, 127),
+                (NOTE_ON, NOTE_ACCEPT, 127),
+            ]
+
+    commands.clear()
+    controller.poll(FakeControlMidi())
+    assert commands == [("agent", "send-keys", "w1:p1", "enter")], commands
 
     class ImmediateFuture:
         def __init__(self, function, arguments):
@@ -1870,7 +1895,7 @@ def self_test():
     smart_controller = HerdrController(
         tracker, command=fake_herdr, clipboard=lambda: "smart prompt", automation=smart
     )
-    assert smart_controller.handle(CC_PROMPT, 127)
+    assert smart_controller.handle(NOTE_PROMPT, 127)
     smart.poll(fake, tracker)
     routed_command = ("agent", "prompt", "w2:p3", "smart prompt")
     assert routed_command in commands
@@ -1886,7 +1911,7 @@ def self_test():
         automation=smart_actions,
     )
     before_smart_action = len(commands)
-    assert smart_action_controller.handle(CC_SMART_ACTION, 127)
+    assert smart_action_controller.handle(NOTE_SMART_ACTION, 127)
     smart_state, smart_questions = smart_action_client.calls[-1]
     assert smart_state["clipboard"] == "review the current diff"
     assert set(smart_questions) == {"action", "target"}
@@ -1906,7 +1931,7 @@ def self_test():
         clipboard=lambda: "continue the implementation",
         automation=prompt_actions,
     )
-    assert prompt_action_controller.handle(CC_SMART_ACTION, 127)
+    assert prompt_action_controller.handle(NOTE_SMART_ACTION, 127)
     prompt_actions.poll(fake, tracker)
     smart_prompt_command = (
         "agent",
@@ -1928,7 +1953,7 @@ def self_test():
         automation=failed_smart,
     )
     before_failed_smart = len(commands)
-    assert failed_smart_controller.handle(CC_SMART_ACTION, 127)
+    assert failed_smart_controller.handle(NOTE_SMART_ACTION, 127)
     failed_smart.poll(fake, tracker)
     expected_smart_fallback = (
         "plugin",
@@ -1949,7 +1974,7 @@ def self_test():
         clipboard=lambda: "fallback prompt",
         automation=failed,
     )
-    assert failed_controller.handle(CC_PROMPT, 127)
+    assert failed_controller.handle(NOTE_PROMPT, 127)
     failed.poll(fake, tracker)
     fallback_command = ("agent", "prompt", "w1:p1", "fallback prompt")
     assert fallback_command in commands
@@ -1965,7 +1990,7 @@ def self_test():
         clipboard=lambda: "unmatched prompt",
         automation=unmatched,
     )
-    assert unmatched_controller.handle(CC_PROMPT, 127)
+    assert unmatched_controller.handle(NOTE_PROMPT, 127)
     unmatched.poll(fake, tracker)
     unmatched_command = ("agent", "prompt", "w1:p1", "unmatched prompt")
     assert unmatched_command not in commands
@@ -2132,7 +2157,7 @@ def self_test():
     attention_controller = HerdrController(
         tracker, command=attention_herdr, automation=ranked
     )
-    assert attention_controller.handle(CC_AGENT_NEXT, 127)
+    assert attention_controller.handle(NOTE_AGENT_NEXT, 127)
     expected_attention_focus = ("agent", "focus", "w2:p3")
     assert commands[-1] == expected_attention_focus
 
