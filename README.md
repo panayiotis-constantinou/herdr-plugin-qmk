@@ -4,7 +4,7 @@ A Herdr plugin that mirrors agent state on a QMK keyboard and turns the keyboard
 
 ## Requirements
 
-- Linux or macOS with the QMK keyboard connected over USB. The keyboard firmware must expose the USB MIDI interface.
+- A QMK keyboard exposing USB MIDI, connected to the host or to the iPad via a duplex RTP-MIDI bridge.
 - Linux writes to the matching `/dev/snd/midiC*D*` device node (granted to the active seat user by default).
 - macOS sends through CoreMIDI. `python3` ships with the Xcode Command Line Tools; override the interpreter with `HERDR_QMK_PYTHON` if needed.
 - The optional `rtmidi:` backend requires `python-rtmidi`; direct USB operation remains dependency-free. Set `HERDR_QMK_PYTHON`, or write the Python executable path to the plugin config file named `python`.
@@ -44,24 +44,26 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 `TYPESAFE_MODEL` optionally overrides the default `jev-latest` model. When enabled, TypeSafe runs bounded typed judgments in background threads:
 
 - **Choice** routes CC 126 clipboard prompts to the most relevant live agent; low-confidence or failed requests fall back to the focused agent, while an explicit no-match leaves the clipboard unsent.
-- **Noul** decides whether a completed-agent transition merits a sound. Blocked-agent sounds remain deterministic and immediate.
-- **Score** breaks semantic ties between agents of the same status when more than four compete for LED slots; status priority remains deterministic.
+- **Choice** caches implementation, review, research, planning, operations, documentation, or general role tags when agent metadata changes. Roles improve routing and attention ranking but never alter agent state.
+- **Choice** makes CC 123 select one safe action from prompting or focusing an existing agent, opening the agent picker, Hunk, or LazyGit, and doing nothing. Missing, failed, or low-confidence judgments open the command palette instead.
+- **Noul** batches nearby completed-agent transitions and decides whether one sound is useful. Blocked-agent sounds remain deterministic and immediate.
+- **Score** maintains an attention order from agent task metadata. It breaks same-status LED-slot ties and makes CC 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
 
 Requests may include up to 4,000 characters of clipboard text plus agent metadata such as pane ID, project path, title, status, and workspace label. Terminal scrollback and agent conversations are not sent. Without an API key, or when ranking fails, existing local behavior continues; prompt and completion-chime failures use the deterministic fallback after the two-second request timeout.
 
 ## iPad over RTP-MIDI
 
-The Mosh connection does not carry USB MIDI. Run an RTP-MIDI bridge on the Herdr host and make this one-way route on the iPad:
+The Mosh connection does not carry USB MIDI. Run an RTP-MIDI bridge on the Herdr host and route MIDI in both directions on the iPad:
 
 ```text
-qmk-herdr → rtpmidid → RTP-MIDI app → midimittr → Planck EZ
+qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 ```
 
 1. Grant **RTP-MIDI (Network MIDI)** Local Network access, enable its session, set the connection policy to **In Contacts**, and add/select the Herdr host on UDP port `5004`.
-2. In the free **midimittr** app, enable `Network Session 1` only as a source and the Planck EZ only as a destination. midimittr advertises background operation.
+2. In the free **midimittr** app, route `Network Session 1` → Planck EZ for LEDs and Planck EZ → `Network Session 1` for controls. Do not route either endpoint back to itself; midimittr advertises background operation.
 3. Keep Tailscale connected. RTP-MIDI is unencrypted and uses adjacent UDP control/data ports `5004` and `5005`, so restrict both to the intended peer. Configure `rtmidi:` with the per-peer sequencer port name exposed by rtpmidid.
 
-The keyboard firmware receives the same MIDI CC protocol as local USB operation, so its LEDs, controls, and onboard speaker need no network-specific mode.
+Flash the matching QMK firmware: its Herdr layer sends CC 100–109 and 116–127 on channel 15 instead of F13–F24. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
 
@@ -98,7 +100,8 @@ The bridge uses MIDI channel 15 and dispatches only CC value `127`:
 | 119 | Open the plugin command palette |
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
-| 122 | Focus the next live agent in Herdr's agent-list order, wrapping |
+| 122 | Focus the next live agent in TypeSafe attention order, or Herdr's list order without a confident ranking |
+| 123 | Classify the clipboard into a safe contextual action, or open the command palette without a confident result |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
 | 126 | Submit clipboard text to the TypeSafe-selected agent, or the focused agent without TypeSafe |
@@ -112,7 +115,7 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 
 - Six center Planck EZ LEDs, or the six innermost covered Moonlander keys: orange comet while any agent is working.
 - Planck EZ bottom-center LED: red disconnected, amber blocked, blue working, green done, dim white idle, purple unknown/overflow.
-- Four Planck EZ outer-bottom LEDs: stable status-prioritized slots; TypeSafe can rank same-status overflow.
+- Four Planck EZ outer-bottom LEDs: stable status-prioritized slots; TypeSafe can rank same-status agents by attention value.
 - Caps Lock, Scroll Lock, and mouse-jiggler indicators return when the spinner is idle.
 - The Planck EZ speaker always cues connection and blocked transitions; TypeSafe can suppress low-value done cues.
 
