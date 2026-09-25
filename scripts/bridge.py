@@ -56,6 +56,10 @@ EMPTY_SLOT = 7
 SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
 MIDI_POLL_SECONDS = 0.05
+ALSA_SEQ_CLIENTS = "/proc/asound/seq/clients"
+# Distinct names let the bridge find its own clients in ALSA_SEQ_CLIENTS.
+RTMIDI_OUT_CLIENT = "QMK bridge out"
+RTMIDI_IN_CLIENT = "QMK bridge in"
 COMMAND_TIMEOUT_SECONDS = 2.0
 TYPESAFE_TIMEOUT_SECONDS = 2.0
 TYPESAFE_MIN_CONFIDENCE = 0.7
@@ -360,6 +364,30 @@ class CoreMidiOut(MidiOut):
             raise BridgeError(f"MIDISend failed: {status}")
 
 
+def alsa_client_linked(client_name, direction, text=None):
+    """Whether the named ALSA sequencer client still has a subscription.
+
+    Returns None when unknowable (no /proc on macOS, or client not listed).
+    """
+    if text is None:
+        try:
+            with open(ALSA_SEQ_CLIENTS, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            return None
+    in_client = False
+    linked = False
+    for line in text.splitlines():
+        match = re.match(r'Client +\d+ : "(.*)" \[', line)
+        if match:
+            if in_client:
+                break
+            in_client = match.group(1) == client_name
+        elif in_client and line.strip().startswith(f"{direction}:"):
+            linked = True
+    return linked if in_client else None
+
+
 class RtMidiOut(MidiOut):
     """Use a named CoreMIDI/ALSA sequencer port via python-rtmidi."""
 
@@ -375,8 +403,8 @@ class RtMidiOut(MidiOut):
                 import rtmidi  # type: ignore[import-not-found]
             except ImportError as error:
                 raise BridgeError("rtmidi backend requires python-rtmidi") from error
-            self.midi_out = rtmidi.MidiOut()
-            self.midi_in = rtmidi.MidiIn()
+            self.midi_out = rtmidi.MidiOut(name=RTMIDI_OUT_CLIENT)
+            self.midi_in = rtmidi.MidiIn(name=RTMIDI_IN_CLIENT)
 
         midi_out = self.midi_out
         midi_in = self.midi_in
@@ -425,6 +453,18 @@ class RtMidiOut(MidiOut):
         # RtMidi keeps its ALSA client until destruction; reuse it on retries.
         self.opened = False
 
+    def heartbeat(self):
+        # ALSA drops the subscription silently when the port's owner exits
+        # (e.g. rtpmidid restarts, often under the same client number), so
+        # sends would vanish without error; force a reopen instead.
+        for client, direction in (
+            (RTMIDI_OUT_CLIENT, "Connecting To"),
+            (RTMIDI_IN_CLIENT, "Connected From"),
+        ):
+            if alsa_client_linked(client, direction) is False:
+                raise BridgeError(f"MIDI port matching {self.name!r} disappeared")
+        super().heartbeat()
+
     def send(self, control, value):
         if self.midi_out is None or not self.opened:
             raise BridgeError("MIDI sequencer destination is closed")
@@ -467,6 +507,11 @@ class FallbackMidiOut(MidiOut):
         if self.active is not None:
             self.active.close()
             self.active = None
+
+    def heartbeat(self):
+        if self.active is None:
+            raise BridgeError("all MIDI destinations are closed")
+        self.active.heartbeat()
 
     def send(self, control, value):
         if self.active is None:
@@ -1602,12 +1647,25 @@ def self_test():
     expected_state = (CC_STATE, value)
     assert fake.sent[-1] == expected_state, fake.sent[-1]
 
+    seq_clients = """Client 129 : "QMK bridge out" [User Legacy]
+  Port   0 : "RtMidi output" (R-e-) [Out]
+    Connecting To: 128:0
+Client 130 : "QMK bridge in" [User Legacy]
+  Port   0 : "RtMidi input" (-We-) [In]
+Client 131 : "Other" [User Legacy]
+  Port   0 : "x" (RWe-) [In/Out]
+    Connected From: 128:0
+"""
+    assert alsa_client_linked("QMK bridge out", "Connecting To", seq_clients)
+    assert alsa_client_linked("QMK bridge in", "Connected From", seq_clients) is False
+    assert alsa_client_linked("missing", "Connecting To", seq_clients) is None
+
     ports_available = [True]
 
     class FakeRtMidiOut:
         instances = []
 
-        def __init__(self):
+        def __init__(self, name=None):
             self.opened = None
             self.sent = []
             self.closed = False
@@ -1628,7 +1686,7 @@ def self_test():
     class FakeRtMidiIn:
         instances = []
 
-        def __init__(self):
+        def __init__(self, name=None):
             self.opened = None
             self.events = [([NOTE_ON, NOTE_ACCEPT, 127], 0.0)]
             self.closed = False
