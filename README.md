@@ -43,13 +43,11 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 
 `TYPESAFE_MODEL` optionally overrides the default `jev-latest` model. When enabled, TypeSafe runs bounded typed judgments in background threads:
 
-- **Choice** routes note 126 clipboard prompts to the most relevant live agent; low-confidence or failed requests fall back to the focused agent, while an explicit no-match leaves the clipboard unsent.
 - **Choice** caches implementation, review, research, planning, operations, documentation, or general role tags when agent metadata changes. Roles improve routing and attention ranking but never alter agent state.
-- **Choice** makes note 123 select one safe action from prompting or focusing an existing agent, opening the agent picker, Hunk, or LazyGit, and doing nothing. Missing, failed, or low-confidence judgments open the command palette instead.
 - **Noul** batches nearby completed-agent transitions and decides whether one sound is useful. Blocked-agent sounds remain deterministic and immediate.
 - **Score** maintains an attention order from agent task metadata. It breaks same-status LED-slot ties and makes note 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
 
-Requests may include up to 4,000 characters of clipboard text plus agent metadata such as pane ID, project path, title, status, and workspace label. Terminal scrollback and agent conversations are not sent. Without an API key, or when ranking fails, existing local behavior continues; prompt and completion-chime failures use the deterministic fallback after the two-second request timeout.
+Requests include agent metadata such as pane ID, project path, title, and status; clipboard text, terminal scrollback, and agent conversations are not sent. Without an API key, or when ranking fails, existing local behavior continues; completion-chime failures use the deterministic fallback after the two-second request timeout.
 
 ## iPad over RTP-MIDI
 
@@ -63,6 +61,8 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 2. In the free **midimittr** app, route `Network Session 1` → Planck EZ for LEDs and Planck EZ → `Network Session 1` for controls. Do not route either endpoint back to itself; midimittr advertises background operation.
 3. Keep Tailscale connected. RTP-MIDI is unencrypted and uses adjacent UDP control/data ports `5004` and `5005`, so restrict both to the intended peer. Configure `rtmidi:` with the per-peer sequencer port name exposed by rtpmidid.
 
+On Panix/fractal, `rtpmidid-qmk-herdr.service` initiates the connection to the iPad's Tailscale address (`100.64.0.3:5004`) under the stable peer name `qmk-herdr-ipad`. Add fractal (`100.64.0.1:5004`) to the iPad app's contacts and allow incoming connections from it. Keep the iPad session enabled and Tailscale connected; a LAN-only peer address will not work away from home. The Panix `midi-port` setting intentionally selects only `rtmidi:qmk-herdr-ipad`, not a keyboard attached to the server.
+
 Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–109 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
@@ -72,6 +72,15 @@ herdr plugin action invoke status --plugin panayiotis.qmk-herdr
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 ```
+
+### Verify the complete path
+
+A running plugin or a bridge log saying `connected to MIDI` only proves the local MIDI endpoint opened. It does **not** prove the RTP peer, iPad routing, or keyboard is connected.
+
+1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs.
+2. With the Planck connected to the iPad, enable both midimittr routes. Its bottom-center LED should leave disconnected red when matching heartbeats arrive (enable RGB first).
+3. In a disposable Herdr workspace, use previous/next tab on the keyboard's Herdr layer. The remote session must change tabs: this checks the return path, not just LED output.
+4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck should turn red and stop the spinner within five seconds. Restore the route and verify recovery, including while the terminal app is foregrounded.
 
 ## Develop
 
@@ -101,10 +110,10 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
 | 122 | Focus the next live agent in TypeSafe attention order, or Herdr's list order without a confident ranking |
-| 123 | Classify the clipboard into a safe contextual action, or open the command palette without a confident result |
+| 123 | Open the command palette |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
-| 126 | Submit clipboard text to the TypeSafe-selected agent, or the focused agent without TypeSafe |
+| 126 | Submit clipboard text directly to the focused agent (no TypeSafe request) |
 | 127 | Send Ctrl-C to the agent in the focused pane |
 
 Plugin-backed controls require Lancodev Jump, Herdr Floax, Herdr LazyGit, the command palette, and Hunk Diff to be installed and enabled.
@@ -114,7 +123,7 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 ## Keyboard display
 
 - Six center Planck EZ LEDs, or the six innermost covered Moonlander keys: orange comet while any agent is working.
-- Planck EZ bottom-center LED: red disconnected, amber blocked, blue working, green done, dim white idle, purple unknown/overflow.
+- Planck EZ bottom-center LED: red disconnected, amber blocked, blue working, green done, dim white idle, bright white unknown/overflow.
 - Four Planck EZ outer-bottom LEDs: stable status-prioritized slots; TypeSafe can rank same-status agents by attention value.
 - Caps Lock, Scroll Lock, and mouse-jiggler indicators return when the spinner is idle.
 - The keyboard speaker always cues connection and blocked transitions; TypeSafe can suppress low-value done cues.
@@ -123,7 +132,9 @@ The keyboard stops the working animation if bridge heartbeats time out.
 
 ## Firmware
 
-The matching Miryoku firmware lives in the QMK fork under the Planck EZ and Moonlander keymaps.
+The matching Miryoku firmware lives in the [QMK fork](https://github.com/panayiotis-constantinou/qmk_firmware) under `keyboards/zsa/planck_ez/keymaps/manna-harbour_miryoku` and the equivalent Moonlander keymap. The local Panix checkout is `~/Projects/qmk_firmware`; shared protocol handling is in `users/manna-harbour_miryoku/herdr.c`. Uncommitted firmware changes must be included in the build; a stock/Oryx image does not implement this protocol. Per-key RGB requires the Planck EZ **Glow** variant.
+
+Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
 
 Build both with:
 
