@@ -655,11 +655,8 @@ class TypeSafeAutomation:
         "state_change_seq",
     )
 
-    def __init__(
-        self, client=None, command=run_herdr, executor=None, clock=time.monotonic
-    ):
+    def __init__(self, client=None, executor=None, clock=time.monotonic):
         self.client = client or TypeSafeClient()
-        self.command = command
         self.executor = executor
         self.clock = clock
         if self.client.enabled and self.executor is None:
@@ -780,111 +777,6 @@ class TypeSafeAutomation:
 
         future.add_done_callback(done)
         return True
-
-    def _candidates(self):
-        agents = self.command("agent", "list")["agents"]
-        workspaces = {
-            item["workspace_id"]: item.get("label", "")
-            for item in self.command("workspace", "list")["workspaces"]
-        }
-        candidates = []
-        criteria = {}
-        option_to_pane = {}
-        for index, agent in enumerate(agents):
-            candidate = self._agent_state(agent)
-            candidate["workspace_label"] = workspaces.get(agent.get("workspace_id"), "")
-            candidates.append(candidate)
-            option = f"agent_{index}"
-            option_to_pane[option] = agent["pane_id"]
-            criteria[option] = (
-                f"Agent in {candidate.get('workspace_label') or candidate.get('cwd')}; "
-                f"task/title: {candidate.get('title') or candidate.get('terminal_title_stripped')}; "
-                f"role: {candidate.get('role', 'unknown')}; "
-                f"status: {candidate.get('agent_status')}"
-            )
-        return candidates, criteria, option_to_pane
-
-    def route_prompt(self, prompt, focused_pane_id):
-        if not self.client.enabled:
-            return False
-        try:
-            candidates, criteria, option_to_pane = self._candidates()
-        except Exception:
-            return False
-        if not candidates:
-            return False
-        criteria["no_match"] = "No live agent is meaningfully related to the prompt"
-        state = {"prompt": prompt[:4000], "agents": candidates}
-        questions = {
-            "target": {
-                "type": "choice",
-                "instructions": (
-                    "Which live agent is best suited to receive `prompt`? Choose by "
-                    "project and task relevance, not merely current activity."
-                ),
-                "criteria": criteria,
-            }
-        }
-        context = {
-            "prompt": prompt,
-            "focused": focused_pane_id,
-            "option_to_pane": option_to_pane,
-            "deadline": self.clock() + 5.0,
-        }
-        return self._submit("prompt", context, state, questions)
-
-    def smart_action(self, clipboard, focused_pane_id):
-        if not self.client.enabled:
-            return False
-        try:
-            candidates, criteria, option_to_pane = self._candidates()
-        except Exception:
-            return False
-        questions = {
-            "action": {
-                "type": "choice",
-                "instructions": (
-                    "Which safe keyboard action best matches `clipboard` and the current "
-                    "Herdr session? Prefer no_action when intent is unclear."
-                ),
-                "criteria": {
-                    "prompt_agent": (
-                        "Send the clipboard as an instruction to a related existing agent"
-                    ),
-                    "focus_agent": (
-                        "Focus a related existing agent without sending the clipboard"
-                    ),
-                    "open_picker": "Start or select work because no existing agent fits",
-                    "open_hunk": "Open the worktree diff for review or inspection",
-                    "open_lazygit": "Open LazyGit for repository state or history",
-                    "no_action": "The clipboard is ambiguous, unsafe, or not actionable",
-                },
-            }
-        }
-        if candidates:
-            target_criteria = dict(
-                criteria, no_match="No live agent fits the clipboard"
-            )
-            questions["target"] = {
-                "type": "choice",
-                "instructions": (
-                    "Which live agent is most relevant to `clipboard` if the selected "
-                    "action needs an agent?"
-                ),
-                "criteria": target_criteria,
-            }
-        context = {
-            "clipboard": clipboard,
-            "focused": focused_pane_id,
-            "option_to_pane": option_to_pane,
-            "deadline": self.clock() + 5.0,
-        }
-        return self._submit(
-            "smart",
-            context,
-            {"clipboard": clipboard[:4000], "agents": candidates},
-            questions,
-        )
 
     def _schedule_ranking(self, agents):
         key = self._ranking_key(agents)
@@ -1009,119 +901,6 @@ class TypeSafeAutomation:
             },
         )
 
-    def _apply_prompt(self, context, answers, error):
-        if self.clock() > context["deadline"]:
-            log("smart prompt expired; routing to the focused agent")
-            error = BridgeError("routing deadline exceeded")
-        target = None
-        if error is None:
-            answer = answers.get("target", {})
-            if (
-                answer.get("type") == "choice"
-                and self._number(answer.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE
-            ):
-                if answer.get("choice") == "no_match":
-                    log("smart prompt found no suitable live agent")
-                    return
-                target = context["option_to_pane"].get(answer.get("choice"))
-        try:
-            live = {
-                agent["pane_id"] for agent in self.command("agent", "list")["agents"]
-            }
-            if target not in live:
-                target = context["focused"] if context["focused"] in live else None
-            if target is None:
-                log("smart prompt found no suitable live agent")
-                return
-            self.command("agent", "prompt", target, context["prompt"])
-            log(f"smart prompt routed to {target}")
-        except Exception as prompt_error:
-            log(f"smart prompt failed: {prompt_error}")
-
-    def _smart_fallback(self):
-        try:
-            self.command(
-                "plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"
-            )
-        except Exception as fallback_error:
-            log(f"smart action fallback failed: {fallback_error}")
-
-    def _apply_smart(self, context, answers, error):
-        if self.clock() > context["deadline"]:
-            log("smart action expired; opening the command palette")
-            self._smart_fallback()
-            return
-        action_answer = answers.get("action", {})
-        if (
-            error is not None
-            or action_answer.get("type") != "choice"
-            or self._number(action_answer.get("confidence")) < TYPESAFE_MIN_CONFIDENCE
-        ):
-            self._smart_fallback()
-            return
-        action = action_answer.get("choice")
-        if action == "no_action":
-            log("smart action found no safe match")
-            return
-        commands = {
-            "open_picker": (
-                "plugin",
-                "action",
-                "invoke",
-                "open",
-                "--plugin",
-                "lancodev.jump",
-            ),
-            "open_hunk": (
-                "plugin",
-                "action",
-                "invoke",
-                "worktree-tab",
-                "--plugin",
-                "hunk.diff",
-            ),
-            "open_lazygit": (
-                "plugin",
-                "action",
-                "invoke",
-                "open",
-                "--plugin",
-                "herdr-lazygit",
-            ),
-        }
-        if action in commands:
-            try:
-                self.command(*commands[action])
-                log(f"smart action selected {action}")
-            except Exception as action_error:
-                log(f"smart action failed: {action_error}")
-            return
-        if action not in ("prompt_agent", "focus_agent"):
-            self._smart_fallback()
-            return
-        target_answer = answers.get("target", {})
-        if (
-            target_answer.get("type") != "choice"
-            or self._number(target_answer.get("confidence")) < TYPESAFE_MIN_CONFIDENCE
-        ):
-            self._smart_fallback()
-            return
-        target = context["option_to_pane"].get(target_answer.get("choice"))
-        try:
-            live = {
-                agent["pane_id"] for agent in self.command("agent", "list")["agents"]
-            }
-            if target not in live:
-                self._smart_fallback()
-            elif action == "prompt_agent":
-                self.command("agent", "prompt", target, context["clipboard"])
-                log(f"smart action prompted {target}")
-            else:
-                self.command("agent", "focus", target)
-                log(f"smart action focused {target}")
-        except Exception as action_error:
-            log(f"smart action failed: {action_error}")
-
     def _apply_chime(self, midi, tracker, context, answers, error):
         if context["signature"] != self.signature:
             return
@@ -1191,11 +970,7 @@ class TypeSafeAutomation:
                     self.last_error = message
             else:
                 self.last_error = None
-            if kind == "prompt":
-                self._apply_prompt(context, answers or {}, error)
-            elif kind == "smart":
-                self._apply_smart(context, answers or {}, error)
-            elif kind == "chime":
+            if kind == "chime":
                 self._apply_chime(midi, tracker, context, answers or {}, error)
             elif kind == "rank":
                 self._apply_rank(midi, tracker, context, answers or {}, error)
@@ -1302,7 +1077,7 @@ class HerdrController:
             self.command(
                 "plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"
             )
-        elif control == NOTE_PALETTE:
+        elif control in (NOTE_PALETTE, NOTE_SMART_ACTION):
             self.command(
                 "plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"
             )
@@ -1324,25 +1099,6 @@ class HerdrController:
             focused = self._focused_pane()["pane_id"]
             current = panes.index(focused) if focused in panes else -1
             self.command("agent", "focus", panes[(current + 1) % len(panes)])
-        elif control == NOTE_SMART_ACTION:
-            pane_id = self._focused_pane()["pane_id"]
-            try:
-                clipboard = self.clipboard()
-            except BridgeError:
-                clipboard = None
-            if (
-                clipboard is None
-                or self.automation is None
-                or not self.automation.smart_action(clipboard, pane_id)
-            ):
-                self.command(
-                    "plugin",
-                    "action",
-                    "invoke",
-                    "open",
-                    "--plugin",
-                    "jt.command-palette",
-                )
         elif control in (NOTE_ACCEPT, NOTE_REJECT, NOTE_CLEAR):
             keys = {NOTE_ACCEPT: "enter", NOTE_REJECT: "esc", NOTE_CLEAR: "ctrl+c"}
             self.command(
@@ -1351,10 +1107,7 @@ class HerdrController:
         elif control == NOTE_PROMPT:
             pane_id = self._focused_pane()["pane_id"]
             prompt = self.clipboard()
-            if self.automation is None or not self.automation.route_prompt(
-                prompt, pane_id
-            ):
-                self.command("agent", "prompt", pane_id, prompt)
+            self.command("agent", "prompt", pane_id, prompt)
         else:
             return False
         return True
@@ -1880,7 +1633,7 @@ Client 131 : "Other" [User Legacy]
 
     http_client = TypeSafeClient("secret", "jev-test", opener=fake_open)
     http_answers = http_client.evaluate(
-        {"prompt": "test"},
+        {"agents": [{"pane_id": "w1:p1"}]},
         {
             "target": {
                 "type": "choice",
@@ -1904,15 +1657,11 @@ Client 131 : "Other" [User Legacy]
         def __init__(
             self,
             noul=1.0,
-            choice="agent_1",
             role="implementation",
-            action="open_hunk",
             fail=False,
         ):
             self.noul = noul
-            self.choice = choice
             self.role = role
-            self.action = action
             self.fail = fail
             self.calls = []
 
@@ -1925,15 +1674,7 @@ Client 131 : "Other" [User Legacy]
                 if question["type"] == "choice":
                     answers[question_id] = {
                         "type": "choice",
-                        "choice": (
-                            self.action
-                            if question_id == "action"
-                            else (
-                                self.role
-                                if question_id.startswith("role_")
-                                else self.choice
-                            )
-                        ),
+                        "choice": self.role,
                         "confidence": 0.99,
                     }
                 elif question["type"] == "noul":
@@ -1947,111 +1688,20 @@ Client 131 : "Other" [User Legacy]
                     }
             return answers
 
-    smart = TypeSafeAutomation(
-        FakeTypeSafeClient(), command=fake_herdr, executor=ImmediateExecutor()
-    )
+    client = FakeTypeSafeClient()
+    smart = TypeSafeAutomation(client, executor=ImmediateExecutor())
     smart_controller = HerdrController(
-        tracker, command=fake_herdr, clipboard=lambda: "smart prompt", automation=smart
+        tracker, command=fake_herdr, clipboard=lambda: "test prompt", automation=smart
     )
+    commands.clear()
+    assert smart_controller.handle(NOTE_SMART_ACTION, 127)
     assert smart_controller.handle(NOTE_PROMPT, 127)
-    smart.poll(fake, tracker)
-    routed_command = ("agent", "prompt", "w2:p3", "smart prompt")
-    assert routed_command in commands
-
-    smart_action_client = FakeTypeSafeClient(action="open_hunk")
-    smart_actions = TypeSafeAutomation(
-        smart_action_client, command=fake_herdr, executor=ImmediateExecutor()
-    )
-    smart_action_controller = HerdrController(
-        tracker,
-        command=fake_herdr,
-        clipboard=lambda: "review the current diff",
-        automation=smart_actions,
-    )
-    before_smart_action = len(commands)
-    assert smart_action_controller.handle(NOTE_SMART_ACTION, 127)
-    smart_state, smart_questions = smart_action_client.calls[-1]
-    assert smart_state["clipboard"] == "review the current diff"
-    assert set(smart_questions) == {"action", "target"}
-    smart_actions.poll(fake, tracker)
-    expected_smart_action = [
-        ("plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff")
+    expected = [
+        ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
+        ("agent", "prompt", "w1:p1", "test prompt"),
     ]
-    assert commands[before_smart_action:] == expected_smart_action
-
-    prompt_action_client = FakeTypeSafeClient(action="prompt_agent")
-    prompt_actions = TypeSafeAutomation(
-        prompt_action_client, command=fake_herdr, executor=ImmediateExecutor()
-    )
-    prompt_action_controller = HerdrController(
-        tracker,
-        command=fake_herdr,
-        clipboard=lambda: "continue the implementation",
-        automation=prompt_actions,
-    )
-    assert prompt_action_controller.handle(NOTE_SMART_ACTION, 127)
-    prompt_actions.poll(fake, tracker)
-    smart_prompt_command = (
-        "agent",
-        "prompt",
-        "w2:p3",
-        "continue the implementation",
-    )
-    assert smart_prompt_command in commands
-
-    failed_smart = TypeSafeAutomation(
-        FakeTypeSafeClient(fail=True),
-        command=fake_herdr,
-        executor=ImmediateExecutor(),
-    )
-    failed_smart_controller = HerdrController(
-        tracker,
-        command=fake_herdr,
-        clipboard=lambda: "ambiguous action",
-        automation=failed_smart,
-    )
-    before_failed_smart = len(commands)
-    assert failed_smart_controller.handle(NOTE_SMART_ACTION, 127)
-    failed_smart.poll(fake, tracker)
-    expected_smart_fallback = (
-        "plugin",
-        "action",
-        "invoke",
-        "open",
-        "--plugin",
-        "jt.command-palette",
-    )
-    assert commands[before_failed_smart:] == [expected_smart_fallback]
-
-    failed = TypeSafeAutomation(
-        FakeTypeSafeClient(fail=True), command=fake_herdr, executor=ImmediateExecutor()
-    )
-    failed_controller = HerdrController(
-        tracker,
-        command=fake_herdr,
-        clipboard=lambda: "fallback prompt",
-        automation=failed,
-    )
-    assert failed_controller.handle(NOTE_PROMPT, 127)
-    failed.poll(fake, tracker)
-    fallback_command = ("agent", "prompt", "w1:p1", "fallback prompt")
-    assert fallback_command in commands
-
-    unmatched = TypeSafeAutomation(
-        FakeTypeSafeClient(choice="no_match"),
-        command=fake_herdr,
-        executor=ImmediateExecutor(),
-    )
-    unmatched_controller = HerdrController(
-        tracker,
-        command=fake_herdr,
-        clipboard=lambda: "unmatched prompt",
-        automation=unmatched,
-    )
-    assert unmatched_controller.handle(NOTE_PROMPT, 127)
-    unmatched.poll(fake, tracker)
-    unmatched_command = ("agent", "prompt", "w1:p1", "unmatched prompt")
-    assert unmatched_command not in commands
+    assert commands == expected
+    assert client.calls == []
 
     now = [0.0]
 
@@ -2060,29 +1710,15 @@ Client 131 : "Other" [User Legacy]
 
     expired = TypeSafeAutomation(
         FakeTypeSafeClient(fail=True),
-        command=fake_herdr,
         executor=ImmediateExecutor(),
         clock=test_clock,
     )
-    assert expired.route_prompt("expired prompt", "w1:p1")
-    now[0] = 6.0
-    expired.poll(fake, tracker)
-    assert ("agent", "prompt", "w1:p1", "expired prompt") in commands
-
-    now[0] = 0.0
-    assert expired.smart_action("expired action", "w1:p1")
-    now[0] = 6.0
-    expired.poll(fake, tracker)
-    assert commands[-1] == expected_smart_fallback
-
-    now[0] = 0.0
     expired._schedule_ranking([{"pane_id": "w1:p1", "agent_status": "idle"}])
     expired.poll(fake, tracker)
     assert expired.rank_key is None
 
     quiet = TypeSafeAutomation(
         FakeTypeSafeClient(noul=0.0),
-        command=fake_herdr,
         executor=ImmediateExecutor(),
         clock=test_clock,
     )
@@ -2111,7 +1747,6 @@ Client 131 : "Other" [User Legacy]
     batch_client = FakeTypeSafeClient(noul=0.0)
     batch = TypeSafeAutomation(
         batch_client,
-        command=fake_herdr,
         executor=ImmediateExecutor(),
         clock=test_clock,
     )
@@ -2132,7 +1767,6 @@ Client 131 : "Other" [User Legacy]
 
     failed_chime = TypeSafeAutomation(
         FakeTypeSafeClient(fail=True),
-        command=fake_herdr,
         executor=ImmediateExecutor(),
         clock=test_clock,
     )
@@ -2160,9 +1794,7 @@ Client 131 : "Other" [User Legacy]
     assert blocked_values[-1] & (1 << 6)
 
     ranked_client = FakeTypeSafeClient()
-    ranked = TypeSafeAutomation(
-        ranked_client, command=fake_herdr, executor=ImmediateExecutor()
-    )
+    ranked = TypeSafeAutomation(ranked_client, executor=ImmediateExecutor())
     ranked_tracker = Tracker()
     ranked_midi = FakeMidi()
     many = [
