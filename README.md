@@ -57,11 +57,11 @@ The Mosh connection does not carry USB MIDI. Run an RTP-MIDI bridge on the Herdr
 qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 ```
 
-1. Grant **RTP-MIDI (Network MIDI)** Local Network access, enable its session, set the connection policy to **In Contacts**, and add/select the Herdr host on UDP port `5004`.
+1. Grant **RTP-MIDI (Network MIDI)** Local Network access, enable its session, set the connection policy to **In Contacts**, and add the Herdr host on UDP port `5004`. Leave the session enabled, but do not initiate a connection to the host from the iPad: **the host must initiate**. If the host is already connected from the iPad's Contacts list, disconnect it there first. Two simultaneous invitations can cause `Invitation Rejected (NO)`.
 2. In the free **midimittr** app, route `Network Session 1` → Planck EZ for LEDs and Planck EZ → `Network Session 1` for controls. Do not route either endpoint back to itself; midimittr advertises background operation.
-3. Keep Tailscale connected. RTP-MIDI is unencrypted and uses adjacent UDP control/data ports `5004` and `5005`, so restrict both to the intended peer. Configure `rtmidi:` with the per-peer sequencer port name exposed by rtpmidid.
+3. Keep Tailscale connected. RTP-MIDI is unencrypted and uses adjacent UDP control/data ports `5004` and `5005`, so restrict both to the intended peer. Configure `midi-port` to **only** the per-peer `rtmidi:` port exposed by rtpmidid (not a local-keyboard fallback).
 
-Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. Keep the iPad session enabled and Tailscale connected; a LAN-only peer address will not work away from home. Point `midi-port` at the per-peer `rtmidi:` port exposed by the bridge.
+Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. A LAN-only peer address will not work away from home. iPadOS may suspend network or MIDI apps in the background; verify recovery after locking the screen and changing networks rather than assuming background operation.
 
 Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–109 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
@@ -75,12 +75,13 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 
 ### Verify the complete path
 
-A running plugin or a bridge log saying `connected to MIDI` only proves the local MIDI endpoint opened. It does **not** prove the RTP peer, iPad routing, or keyboard is connected.
+A running plugin or a bridge log saying `connected to MIDI` only proves the local MIDI endpoint opened. It does **not** prove the RTP peer, iPad routing, or keyboard is connected. The matching firmware echoes each protocol heartbeat as CC 116 value 2 on channel 15; `no keyboard heartbeat echo` in the bridge log means the end-to-end round trip has been absent for five seconds. The warning clears when echoes resume; the bridge does not repeatedly restart a healthy local MIDI port to compensate for a sleeping iPad.
 
-1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect fractal, turn off auto-connect to it, and check that the contact uses the host's Tailscale address and port `5004`; fractal's next retry (every 30 seconds) should then connect.
+1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect the host if the iPad initiated the session, leave the iPad's own session enabled, and check that the contact uses the host's Tailscale address and port `5004`; the host's next retry (every 30 seconds) should then connect.
 2. With the Planck connected to the iPad, enable both midimittr routes. Its bottom-center LED should leave disconnected red when matching heartbeats arrive (enable RGB first).
 3. In a disposable Herdr workspace, use previous/next tab on the keyboard's Herdr layer. The remote session must change tabs: this checks the return path, not just LED output.
-4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck should turn red and stop the spinner within five seconds. Restore the route and verify recovery, including while the terminal app is foregrounded.
+4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck should turn red and stop the spinner within five seconds, and the bridge should warn after five seconds. Restore the route and check for `keyboard heartbeat echo restored`.
+5. Repeat after locking/unlocking the iPad, changing Wi-Fi/cellular, unplugging/replugging the Planck, and restarting rtpmidid. After each recovery, verify both LED updates **and** a harmless previous/next tab action; if either fails, check Tailscale, the RTP-MIDI session, and both midimittr routes.
 
 ## Develop
 
@@ -134,7 +135,7 @@ The keyboard stops the working animation if bridge heartbeats time out.
 
 The matching Miryoku firmware lives in the [QMK fork](https://github.com/panayiotis-constantinou/qmk_firmware) under `keyboards/zsa/planck_ez/keymaps/manna-harbour_miryoku` and the equivalent Moonlander keymap. The local Panix checkout is `~/Projects/qmk_firmware`; shared protocol handling is in `users/manna-harbour_miryoku/herdr.c`. Uncommitted firmware changes must be included in the build; a stock/Oryx image does not implement this protocol. Per-key RGB requires the Planck EZ **Glow** variant.
 
-Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
+Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots. The firmware returns CC 116 value 2 as a round-trip receipt. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
 
 Build both with:
 

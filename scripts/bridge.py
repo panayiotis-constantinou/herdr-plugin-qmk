@@ -39,6 +39,8 @@ NOTE_SCRATCHPAD = 109
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
+CC_ECHO = 116  # returned by the keyboard after each protocol heartbeat
+ECHO_STALE_SECONDS = 5.0
 NOTE_WORKSPACE_NEW = 116
 NOTE_TAB_NEW = 117
 NOTE_LAZYGIT = 118
@@ -396,6 +398,9 @@ class RtMidiOut(MidiOut):
         self.midi_out = None
         self.midi_in = None
         self.opened = False
+        self.echo_started = None
+        self.last_echo = None
+        self.echo_warned = False
 
     def open(self):
         if self.midi_out is None or self.midi_in is None:
@@ -444,6 +449,7 @@ class RtMidiOut(MidiOut):
                 f"cannot open sequencer port matching {self.name!r}: {error}"
             ) from error
         self.opened = True
+        self.echo_started = time.monotonic()
 
     def close(self):
         if self.midi_out is not None:
@@ -452,6 +458,9 @@ class RtMidiOut(MidiOut):
             self.midi_in.close_port()
         # RtMidi keeps its ALSA client until destruction; reuse it on retries.
         self.opened = False
+        self.echo_started = None
+        self.last_echo = None
+        self.echo_warned = False
 
     def heartbeat(self):
         # ALSA drops the subscription silently when the port's owner exits
@@ -461,9 +470,14 @@ class RtMidiOut(MidiOut):
             (RTMIDI_OUT_CLIENT, "Connecting To"),
             (RTMIDI_IN_CLIENT, "Connected From"),
         ):
-            if alsa_client_linked(client, direction) is False:
+            linked = alsa_client_linked(client, direction)
+            if linked is not None and not linked:
                 raise BridgeError(f"MIDI port matching {self.name!r} disappeared")
         super().heartbeat()
+        since = self.last_echo if self.last_echo is not None else self.echo_started
+        if since is not None and time.monotonic() - since > ECHO_STALE_SECONDS and not self.echo_warned:
+            log("no keyboard heartbeat echo; check the iPad MIDI routes and firmware")
+            self.echo_warned = True
 
     def send(self, control, value):
         if self.midi_out is None or not self.opened:
@@ -479,7 +493,12 @@ class RtMidiOut(MidiOut):
             if event is None:
                 return messages
             message, _delta = event
-            if len(message) == 3 and message[0] & 0xF0 in (0x80, 0x90, 0xB0):
+            if len(message) == 3 and message[0] == MIDI_CHANNEL and message[1:] == [CC_ECHO, PROTOCOL]:
+                self.last_echo = time.monotonic()
+                if self.echo_warned:
+                    log("keyboard heartbeat echo restored")
+                    self.echo_warned = False
+            elif len(message) == 3 and message[0] & 0xF0 in (0x80, 0x90, 0xB0):
                 messages.append(tuple(message))
 
 
@@ -1271,7 +1290,7 @@ def watch_session(socket_path, midi, tracker, controller, automation):
                     raise BridgeError("Herdr agent set changed; resubscribing")
             try:
                 chunk = sock.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
                     midi.heartbeat()
                     last_heartbeat = time.monotonic()
@@ -1410,7 +1429,7 @@ Client 131 : "Other" [User Legacy]
     Connected From: 128:0
 """
     assert alsa_client_linked("QMK bridge out", "Connecting To", seq_clients)
-    assert alsa_client_linked("QMK bridge in", "Connected From", seq_clients) is False
+    assert not alsa_client_linked("QMK bridge in", "Connected From", seq_clients)
     assert alsa_client_linked("missing", "Connecting To", seq_clients) is None
 
     ports_available = [True]
@@ -1441,7 +1460,10 @@ Client 131 : "Other" [User Legacy]
 
         def __init__(self, name=None):
             self.opened = None
-            self.events = [([NOTE_ON, NOTE_ACCEPT, 127], 0.0)]
+            self.events = [
+                ([MIDI_CHANNEL, CC_ECHO, PROTOCOL], 0.0),
+                ([NOTE_ON, NOTE_ACCEPT, 127], 0.0),
+            ]
             self.closed = False
             self.instances.append(self)
 
@@ -1462,8 +1484,7 @@ Client 131 : "Other" [User Legacy]
 
     previous_rtmidi = sys.modules.get("rtmidi")
     fake_rtmidi = types.ModuleType("rtmidi")
-    setattr(fake_rtmidi, "MidiOut", FakeRtMidiOut)
-    setattr(fake_rtmidi, "MidiIn", FakeRtMidiIn)
+    fake_rtmidi.__dict__.update(MidiOut=FakeRtMidiOut, MidiIn=FakeRtMidiIn)
     sys.modules["rtmidi"] = fake_rtmidi
     try:
         output = make_midi_out("rtmidi:HERDR-IPAD")
@@ -1472,6 +1493,7 @@ Client 131 : "Other" [User Legacy]
         received = output.receive()
         expected_messages = [(NOTE_ON, NOTE_ACCEPT, 127)]
         assert received == expected_messages
+        assert isinstance(output, RtMidiOut) and output.last_echo is not None
         output.close()
         output_instance = FakeRtMidiOut.instances[-1]
         input_instance = FakeRtMidiIn.instances[-1]
@@ -1492,6 +1514,7 @@ Client 131 : "Other" [User Legacy]
         assert len(FakeRtMidiOut.instances) == before + 1
         ports_available[0] = True
         missing.open()
+        assert isinstance(missing, RtMidiOut)
         assert missing.midi_out is FakeRtMidiOut.instances[-1]
         missing.close()
     finally:
@@ -1523,7 +1546,7 @@ Client 131 : "Other" [User Legacy]
                     {
                         "pane_id": "w1:p1",
                         "workspace_id": "w1",
-                        "cwd": "/tmp/project",
+                        "cwd": "/project",
                         "focused": True,
                     }
                 ]
@@ -1568,8 +1591,8 @@ Client 131 : "Other" [User Legacy]
         ("tab", "focus", "w1:t2"),
         ("plugin", "action", "invoke", "open", "--plugin", "lancodev.jump"),
         ("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax"),
-        ("workspace", "create", "--cwd", "/tmp/project", "--focus"),
-        ("tab", "create", "--workspace", "w1", "--cwd", "/tmp/project", "--focus"),
+        ("workspace", "create", "--cwd", "/project", "--focus"),
+        ("tab", "create", "--workspace", "w1", "--cwd", "/project", "--focus"),
         ("plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"),
         ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
         ("pane", "zoom", "w1:p1", "--toggle"),
@@ -1592,7 +1615,8 @@ Client 131 : "Other" [User Legacy]
 
     commands.clear()
     controller.poll(FakeControlMidi())
-    assert commands == [("agent", "send-keys", "w1:p1", "enter")], commands
+    expected = [("agent", "send-keys", "w1:p1", "enter")]
+    assert commands == expected, commands
 
     class ImmediateFuture:
         def __init__(self, function, arguments):
