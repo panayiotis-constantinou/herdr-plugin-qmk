@@ -77,7 +77,7 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 
 A running plugin or a bridge log saying `connected to MIDI` only proves the local MIDI endpoint opened. It does **not** prove the RTP peer, iPad routing, or keyboard is connected.
 
-1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs.
+1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect fractal, turn off auto-connect to it, and check that the contact uses the host's Tailscale address and port `5004`; fractal's next retry (every 30 seconds) should then connect.
 2. With the Planck connected to the iPad, enable both midimittr routes. Its bottom-center LED should leave disconnected red when matching heartbeats arrive (enable RGB first).
 3. In a disposable Herdr workspace, use previous/next tab on the keyboard's Herdr layer. The remote session must change tabs: this checks the return path, not just LED output.
 4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck should turn red and stop the spinner within five seconds. Restore the route and verify recovery, including while the terminal app is foregrounded.
