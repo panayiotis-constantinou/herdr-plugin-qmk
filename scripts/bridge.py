@@ -42,6 +42,7 @@ CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
 CC_ECHO = 116  # returned by the keyboard after each protocol heartbeat
+CC_RISK = 117  # approval risk for the focused blocked agent
 ECHO_STALE_SECONDS = 5.0
 NOTE_WORKSPACE_NEW = 116
 NOTE_TAB_NEW = 117
@@ -69,6 +70,9 @@ TYPESAFE_TIMEOUT_SECONDS = 2.0
 TYPESAFE_MIN_CONFIDENCE = 0.7
 TYPESAFE_CHIME_THRESHOLD = 0.8
 TYPESAFE_CHIME_DEBOUNCE_SECONDS = 0.25
+# Any real chance of a destructive action shows high risk, even when unsure.
+TYPESAFE_RISK_HIGH_PROBABILITY = 0.3
+BLOCKED_TAIL_LINES = 40
 TYPESAFE_API_URL = "https://api.typesafe.ai/v1/systemone"
 MIDI_PACKET_DATA_SIZE = 256
 
@@ -77,6 +81,37 @@ STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
 STATUS_RANK = {
     status: len(STATUS_PRIORITY) - index for index, status in enumerate(STATUS_PRIORITY)
 }
+# CC_RISK values; zero keeps older firmware and non-TypeSafe bridges neutral.
+RISK_NONE = 0
+RISK_PENDING = 1
+RISK_UNKNOWN = 2
+RISK_LEVELS = [3, 4, 5]  # low, medium, high
+BLOCKED_REASONS = {
+    "permission": (
+        "Waiting for the user to approve or deny a specific tool call, command, "
+        "or file change"
+    ),
+    "question": (
+        "Asked the user a question or offered choices that need a typed or "
+        "selected answer, not a simple approval"
+    ),
+    "error": (
+        "Stopped because of an error, crash, failed command, or exhausted limit "
+        "and needs intervention"
+    ),
+    "other": "None of the above clearly fits",
+}
+# Slot CC bits 3-4; zero means unknown and keeps the plain blocked blink.
+REASON_CODES = {"permission": 1, "question": 2, "error": 3}
+APPROVAL_RISKS = [
+    "The pending action only reads or inspects: viewing files, searching, "
+    "listing, or read-only commands",
+    "The pending action changes files inside the project or runs local builds "
+    "and tests",
+    "The pending action is destructive or reaches outside the project: deleting "
+    "data, force operations, git push, network requests, installing software, "
+    "credentials or secrets, or system configuration",
+]
 AGENT_ROLES = {
     "implementation": "Writing, modifying, debugging, or testing code",
     "review": "Reviewing changes, risks, regressions, or correctness",
@@ -586,6 +621,34 @@ def run_herdr(*args):
         raise BridgeError(f"malformed herdr response: {error}") from error
 
 
+def read_agent_tail(pane_id):
+    try:
+        process = subprocess.run(
+            [
+                "herdr",
+                "agent",
+                "read",
+                pane_id,
+                "--source",
+                "recent",
+                "--lines",
+                str(BLOCKED_TAIL_LINES),
+                "--format",
+                "text",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError(f"herdr agent read {pane_id} timed out") from error
+    if process.returncode:
+        message = process.stderr.strip() or "unknown error"
+        raise BridgeError(f"herdr agent read {pane_id} failed: {message}")
+    return process.stdout
+
+
 def read_clipboard():
     commands = [
         ("wl-paste", "--no-newline"),
@@ -676,8 +739,11 @@ class TypeSafeAutomation:
         "state_change_seq",
     )
 
-    def __init__(self, client=None, executor=None, clock=time.monotonic):
+    def __init__(
+        self, client=None, executor=None, clock=time.monotonic, reader=read_agent_tail
+    ):
         self.client = client or TypeSafeClient()
+        self.reader = reader
         self.executor = executor
         self.clock = clock
         if self.client.enabled and self.executor is None:
@@ -693,6 +759,8 @@ class TypeSafeAutomation:
         self.pending_done = []
         self.chime_due = None
         self.last_error = None
+        # pane_id -> {"seq", "reason", "risk"} for each blocked episode
+        self.blocked = {}
 
     @staticmethod
     def _agent(agent):
@@ -785,9 +853,14 @@ class TypeSafeAutomation:
         ]
 
     def _submit(self, kind, context, state, questions):
+        return self._submit_call(
+            kind, context, lambda: self.client.evaluate(state, questions)
+        )
+
+    def _submit_call(self, kind, context, call):
         if not self.client.enabled or self.executor is None:
             return False
-        future = self.executor.submit(self.client.evaluate, state, questions)
+        future = self.executor.submit(call)
 
         def done(completed):
             try:
@@ -865,11 +938,65 @@ class TypeSafeAutomation:
             questions,
         )
 
+    def tracks_blocked(self):
+        return bool(self.blocked)
+
+    def _judge_blocked(self, pane_id):
+        tail = self.reader(pane_id)
+        return self.client.evaluate(
+            {"terminal_tail": tail},
+            {
+                "reason": {
+                    "type": "choice",
+                    "instructions": (
+                        "Why is the coding agent in `terminal_tail` waiting for the user?"
+                    ),
+                    "criteria": BLOCKED_REASONS,
+                },
+                "risk": {
+                    "type": "score",
+                    "instructions": (
+                        "If the agent in `terminal_tail` is asking to approve an action, "
+                        "how risky is approving it?"
+                    ),
+                    "criteria": APPROVAL_RISKS,
+                },
+            },
+        )
+
+    def _schedule_blocked(self, agents):
+        blocked = {
+            agent["pane_id"]: agent.get("state_change_seq")
+            for agent in agents
+            if agent.get("agent_status") == "blocked"
+        }
+        self.blocked = {
+            pane_id: info
+            for pane_id, info in self.blocked.items()
+            if pane_id in blocked and blocked[pane_id] == info["seq"]
+        }
+        if not self.client.enabled:
+            return
+        for pane_id, seq in blocked.items():
+            if pane_id in self.blocked:
+                continue
+            # Only a blocked agent's recent output leaves the host, once per episode.
+            self.blocked[pane_id] = {"seq": seq, "reason": 0, "risk": RISK_PENDING}
+            self._submit_call(
+                "blocked",
+                {"pane_id": pane_id, "seq": seq},
+                lambda pane_id=pane_id: self._judge_blocked(pane_id),
+            )
+
     def publish(self, midi, tracker, agents, notify):
         self.agents = [dict(agent) for agent in agents]
         self.signature = self._signature(self.agents)
+        self._schedule_blocked(self.agents)
         frame = tracker.update(
-            self.agents, notify=notify, scores=self._scores_for(self.agents)
+            self.agents,
+            notify=notify,
+            scores=self._scores_for(self.agents),
+            blocked=self.blocked,
         )
         self._schedule_ranking(self.agents)
         if frame["chime_blocked"]:
@@ -926,7 +1053,10 @@ class TypeSafeAutomation:
         if context["signature"] != self.signature:
             return
         frame = tracker.update(
-            self.agents, notify=False, scores=self._scores_for(self.agents)
+            self.agents,
+            notify=False,
+            scores=self._scores_for(self.agents),
+            blocked=self.blocked,
         )
 
         def allowed(question, requested):
@@ -973,7 +1103,43 @@ class TypeSafeAutomation:
         self.slot_scores = scores
         self.score_key = context["key"]
         frame = tracker.update(
-            self.agents, notify=False, scores=self._scores_for(self.agents)
+            self.agents,
+            notify=False,
+            scores=self._scores_for(self.agents),
+            blocked=self.blocked,
+        )
+        tracker.send_frame(midi, frame)
+
+    def _apply_blocked(self, midi, tracker, context, answers, error):
+        info = self.blocked.get(context["pane_id"])
+        if info is None or info["seq"] != context["seq"]:
+            return
+        reason = answers.get("reason", {})
+        if (
+            error is None
+            and reason.get("type") == "choice"
+            and self._number(reason.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE
+        ):
+            info["reason"] = REASON_CODES.get(reason.get("choice"), 0)
+        info["risk"] = RISK_UNKNOWN
+        risk = answers.get("risk", {})
+        if (
+            error is None
+            and info["reason"] == REASON_CODES["permission"]
+            and risk.get("type") == "score"
+        ):
+            probabilities = risk.get("probabilities") or {}
+            high = str(len(APPROVAL_RISKS) - 1)
+            if self._number(probabilities.get(high)) >= TYPESAFE_RISK_HIGH_PROBABILITY:
+                info["risk"] = RISK_LEVELS[-1]
+            elif self._number(risk.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE:
+                level = round(self._number(risk.get("score")))
+                info["risk"] = RISK_LEVELS[max(0, min(level, len(RISK_LEVELS) - 1))]
+        frame = tracker.update(
+            self.agents,
+            notify=False,
+            scores=self._scores_for(self.agents),
+            blocked=self.blocked,
         )
         tracker.send_frame(midi, frame)
 
@@ -995,6 +1161,8 @@ class TypeSafeAutomation:
                 self._apply_chime(midi, tracker, context, answers or {}, error)
             elif kind == "rank":
                 self._apply_rank(midi, tracker, context, answers or {}, error)
+            elif kind == "blocked":
+                self._apply_blocked(midi, tracker, context, answers or {}, error)
 
 
 class HerdrController:
@@ -1170,8 +1338,9 @@ class Tracker:
         self.slots = [None] * SLOT_COUNT
         self.previous = {}
 
-    def update(self, agents, notify, scores=None):
+    def update(self, agents, notify, scores=None, blocked=None):
         scores = scores or {}
+        blocked = blocked or {}
         agents = sorted(
             agents,
             key=lambda agent: (
@@ -1204,11 +1373,22 @@ class Tracker:
         frame = {
             "aggregate": aggregate,
             "slots": [
-                STATUS_CODES.get(current[s], EMPTY_SLOT)
-                if s is not None
-                else EMPTY_SLOT
+                (
+                    STATUS_CODES.get(current[s], EMPTY_SLOT)
+                    | (blocked.get(s, {}).get("reason", 0) << 3)
+                    if s is not None
+                    else EMPTY_SLOT
+                )
                 for s in self.slots
             ],
+            "risk": next(
+                (
+                    blocked.get(a["pane_id"], {}).get("risk", RISK_NONE)
+                    for a in agents
+                    if a.get("focused") and a["agent_status"] == "blocked"
+                ),
+                RISK_NONE,
+            ),
             "any_working": any_is("working"),
             "overflow": len(agents) > SLOT_COUNT,
             "chime_done": changed_to("done"),
@@ -1222,6 +1402,7 @@ class Tracker:
         midi.heartbeat()
         for index, status in enumerate(frame["slots"]):
             midi.send(CC_SLOT_FIRST + index, status)
+        midi.send(CC_RISK, frame["risk"])
         value = STATUS_CODES.get(frame["aggregate"], 4)
         value |= frame["any_working"] << 3
         value |= frame["overflow"] << 4
@@ -1313,7 +1494,14 @@ def watch_session(socket_path, midi, tracker, controller, automation):
                 chunk = sock.recv(4096)
             except TimeoutError:
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    midi.heartbeat()
+                    if automation.tracks_blocked():
+                        # Focus changes have no event; follow them for the risk light.
+                        agents = snapshot(socket_path)
+                        if {a["pane_id"] for a in agents} != subscribed:
+                            raise BridgeError("Herdr agent set changed; resubscribing")
+                        automation.publish(midi, tracker, agents, notify=True)
+                    else:
+                        midi.heartbeat()
                     last_heartbeat = time.monotonic()
                 continue
             if not chunk:
@@ -1915,6 +2103,116 @@ Client 131 : "Other" [User Legacy]
     urgent_controller = HerdrController(tracker, command=urgent_herdr)
     assert urgent_controller.handle(NOTE_AGENT_URGENT, 127)
     assert commands[-1] == ("agent", "focus", "w1:p2")
+
+    class BlockedClient:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+            self.reason = "permission"
+            self.probabilities = {"0": 0.8, "1": 0.2, "2": 0.0}
+
+        def evaluate(self, state, questions):
+            self.calls.append((state, questions))
+            if "reason" not in questions:
+                return {}
+            return {
+                "reason": {"type": "choice", "choice": self.reason, "confidence": 0.95},
+                "risk": {
+                    "type": "score",
+                    "score": sum(
+                        int(level) * probability
+                        for level, probability in self.probabilities.items()
+                    ),
+                    "confidence": 0.9,
+                    "probabilities": self.probabilities,
+                },
+            }
+
+    blocked_client = BlockedClient()
+    reads = []
+    judge = TypeSafeAutomation(
+        blocked_client,
+        executor=ImmediateExecutor(),
+        reader=lambda pane_id: reads.append(pane_id) or "Allow `ls`? (y/n)",
+    )
+    judge_tracker = Tracker()
+    judge_midi = FakeMidi()
+
+    def risk_sent():
+        return [
+            item[1] for item in judge_midi.sent if item != "hb" and item[0] == CC_RISK
+        ]
+
+    def slot_sent(index):
+        return [
+            item[1]
+            for item in judge_midi.sent
+            if item != "hb" and item[0] == CC_SLOT_FIRST + index
+        ]
+
+    waiting = [
+        {
+            "pane_id": "b1",
+            "agent_status": "blocked",
+            "state_change_seq": 3,
+            "focused": True,
+        },
+        {"pane_id": "b2", "agent_status": "idle", "state_change_seq": 1},
+    ]
+    judge.publish(judge_midi, judge_tracker, waiting, notify=False)
+    assert risk_sent()[-1] == RISK_PENDING and reads == ["b1"]
+    judged = [
+        state for state, questions in blocked_client.calls if "reason" in questions
+    ]
+    assert judged == [{"terminal_tail": "Allow `ls`? (y/n)"}]
+    assert judge.tracks_blocked()
+    judge.poll(judge_midi, judge_tracker)
+    assert risk_sent()[-1] == RISK_LEVELS[0]
+    assert (
+        slot_sent(judge_tracker.slots.index("b1"))[-1]
+        == STATUS_CODES["blocked"] | 1 << 3
+    )
+    judge.publish(judge_midi, judge_tracker, waiting, notify=True)
+    assert reads == ["b1"], "one request per blocked episode"
+
+    blocked_client.probabilities = {"0": 0.3, "1": 0.3, "2": 0.4}
+    waiting[0]["state_change_seq"] = 5
+    judge.publish(judge_midi, judge_tracker, waiting, notify=True)
+    judge.poll(judge_midi, judge_tracker)
+    assert risk_sent()[-1] == RISK_LEVELS[-1]
+
+    blocked_client.reason = "question"
+    waiting[0]["state_change_seq"] = 7
+    judge.publish(judge_midi, judge_tracker, waiting, notify=True)
+    judge.poll(judge_midi, judge_tracker)
+    assert risk_sent()[-1] == RISK_UNKNOWN
+    assert (
+        slot_sent(judge_tracker.slots.index("b1"))[-1]
+        == STATUS_CODES["blocked"] | 2 << 3
+    )
+
+    waiting[0]["focused"] = False
+    judge.publish(judge_midi, judge_tracker, waiting, notify=True)
+    assert risk_sent()[-1] == RISK_NONE
+    waiting[0]["agent_status"] = "done"
+    judge.publish(judge_midi, judge_tracker, waiting, notify=True)
+    assert not judge.tracks_blocked()
+
+    failing = TypeSafeAutomation(
+        FakeTypeSafeClient(fail=True),
+        executor=ImmediateExecutor(),
+        reader=lambda pane_id: "",
+    )
+    failing_midi = FakeMidi()
+    waiting[0].update(agent_status="blocked", focused=True, state_change_seq=9)
+    failing_tracker = Tracker()
+    failing.publish(failing_midi, failing_tracker, waiting, notify=False)
+    failing.poll(failing_midi, failing_tracker)
+    failed_risk = [
+        item[1] for item in failing_midi.sent if item != "hb" and item[0] == CC_RISK
+    ]
+    assert failed_risk[-1] == RISK_UNKNOWN
 
     fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
     assert isinstance(fallback, FallbackMidiOut)
