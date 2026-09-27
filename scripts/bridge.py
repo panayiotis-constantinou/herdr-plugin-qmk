@@ -36,6 +36,8 @@ NOTE_PANE_UP = 106
 NOTE_PANE_RIGHT = 107
 NOTE_AGENT_PICKER = 108
 NOTE_SCRATCHPAD = 109
+NOTE_AGENT_PREV = 110
+NOTE_AGENT_URGENT = 111
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
@@ -1106,7 +1108,7 @@ class HerdrController:
             self.command(
                 "plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"
             )
-        elif control == NOTE_AGENT_NEXT:
+        elif control in (NOTE_AGENT_NEXT, NOTE_AGENT_PREV, NOTE_AGENT_URGENT):
             agents = self.command("agent", "list")["agents"]
             if not agents:
                 raise BridgeError("Herdr has no live agents")
@@ -1114,10 +1116,29 @@ class HerdrController:
                 self.automation.attention_order(agents)
                 if self.automation is not None
                 else None
-            ) or [agent["pane_id"] for agent in agents]
+            )
+            if control == NOTE_AGENT_URGENT:
+                # Without a confident ranking, blocked agents still come first.
+                panes = panes or [
+                    agent["pane_id"]
+                    for agent in sorted(
+                        agents,
+                        key=lambda agent: (
+                            -STATUS_RANK.get(agent.get("agent_status"), 0),
+                            agent.get("state_change_seq", 0),
+                        ),
+                    )
+                ]
+                self.command("agent", "focus", panes[0])
+                return True
+            panes = panes or [agent["pane_id"] for agent in agents]
             focused = self._focused_pane()["pane_id"]
-            current = panes.index(focused) if focused in panes else -1
-            self.command("agent", "focus", panes[(current + 1) % len(panes)])
+            if focused in panes:
+                delta = 1 if control == NOTE_AGENT_NEXT else -1
+                target = panes[(panes.index(focused) + delta) % len(panes)]
+            else:
+                target = panes[0] if control == NOTE_AGENT_NEXT else panes[-1]
+            self.command("agent", "focus", target)
         elif control in (NOTE_ACCEPT, NOTE_REJECT, NOTE_CLEAR):
             keys = {NOTE_ACCEPT: "enter", NOTE_REJECT: "esc", NOTE_CLEAR: "ctrl+c"}
             self.command(
@@ -1579,6 +1600,8 @@ Client 131 : "Other" [User Legacy]
         NOTE_PANE_ZOOM,
         NOTE_HUNK,
         NOTE_AGENT_NEXT,
+        NOTE_AGENT_PREV,
+        NOTE_AGENT_URGENT,
         NOTE_SMART_ACTION,
         NOTE_ACCEPT,
         NOTE_REJECT,
@@ -1874,6 +1897,24 @@ Client 131 : "Other" [User Legacy]
     assert attention_controller.handle(NOTE_AGENT_NEXT, 127)
     expected_attention_focus = ("agent", "focus", "w2:p3")
     assert commands[-1] == expected_attention_focus
+    assert attention_controller.handle(NOTE_AGENT_PREV, 127)
+    assert commands[-1] == ("agent", "focus", "w1:p2")
+    assert attention_controller.handle(NOTE_AGENT_URGENT, 127)
+    assert commands[-1] == ("agent", "focus", "w1:p1")
+
+    def urgent_herdr(*args):
+        if args == ("agent", "list"):
+            return {
+                "agents": [
+                    {"pane_id": "w1:p1", "agent_status": "idle"},
+                    {"pane_id": "w1:p2", "agent_status": "blocked"},
+                ]
+            }
+        return fake_herdr(*args)
+
+    urgent_controller = HerdrController(tracker, command=urgent_herdr)
+    assert urgent_controller.handle(NOTE_AGENT_URGENT, 127)
+    assert commands[-1] == ("agent", "focus", "w1:p2")
 
     fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
     assert isinstance(fallback, FallbackMidiOut)

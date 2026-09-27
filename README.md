@@ -63,7 +63,7 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 
 Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. A LAN-only peer address will not work away from home. iPadOS may suspend network or MIDI apps in the background; verify recovery after locking the screen and changing networks rather than assuming background operation.
 
-Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–109 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
+Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–111 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
 
@@ -104,6 +104,8 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note
 | 104–107 | Focus the pane left/down/up/right of the focused pane |
 | 108 | Open the Lancodev Jump workspace/agent picker |
 | 109 | Toggle the Herdr Floax floating scratch shell |
+| 110 | Focus the previous live agent in the same order as note 122 |
+| 111 | Focus the most urgent agent: the top of the TypeSafe attention order, or blocked, then working, then done agents without a confident ranking |
 | 116 | Create and focus a workspace rooted at the focused pane's directory |
 | 117 | Create and focus a tab in the focused workspace and directory |
 | 118 | Toggle LazyGit in a split pane |
@@ -111,7 +113,7 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
 | 122 | Focus the next live agent in TypeSafe attention order, or Herdr's list order without a confident ranking |
-| 123 | Open the command palette |
+| 123 | Open the command palette (sent by older firmware; current firmware uses 119) |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
 | 126 | Submit clipboard text directly to the focused agent (no TypeSafe request) |
