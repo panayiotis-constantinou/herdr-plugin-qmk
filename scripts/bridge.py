@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mirror Herdr agent state on a QMK keyboard over USB MIDI.
+"""Mirror Herdr agent state on QMK keyboards over MIDI, one of them active.
 
 Stdlib only: talks to Herdr's Unix socket (newline-delimited JSON-RPC) and
 sends MIDI via the platform backend — the ALSA rawmidi device node on Linux,
@@ -44,7 +44,10 @@ CC_SLOT_FIRST = 112
 CC_ECHO = 116  # returned by the keyboard after each protocol heartbeat
 CC_RISK = 117  # approval risk for the focused blocked agent
 CC_SORT = 118  # from the keyboard with each echo: its slot sort mode
+CC_ACTIVE = 119  # to the keyboard with each heartbeat: 1 active, 0 standby
+CHIME_BITS = 0b1100000  # CC_STATE done/blocked chime flags: active board only
 ECHO_STALE_SECONDS = 5.0
+RECENT_BOARDS_KEPT = 8
 NOTE_WORKSPACE_NEW = 116
 NOTE_TAB_NEW = 117
 NOTE_LAZYGIT = 118
@@ -166,6 +169,13 @@ class MidiOut:
     def close(self):
         pass
 
+    def maintain(self):
+        """Periodic housekeeping between session events; most backends need none."""
+
+    def take_refresh(self):
+        """True once when every keyboard needs the current frame resent."""
+        return False
+
 
 class MidiParser:
     """Parse a MIDI byte stream, including running status and realtime bytes."""
@@ -205,37 +215,35 @@ class MidiParser:
         return messages
 
 
-class AlsaMidiOut(MidiOut):
-    """Duplex handle on the ALSA rawmidi node of a USB MIDI card."""
+def alsa_midi_cards(cards_text=None, nodes=glob.glob):
+    """(index, name) for every ALSA card that exposes a rawmidi node."""
+    if cards_text is None:
+        try:
+            with open("/proc/asound/cards") as cards_file:
+                cards_text = cards_file.read()
+        except OSError as error:
+            raise BridgeError(f"cannot list ALSA cards: {error}") from error
+    cards = []
+    for line in cards_text.splitlines():
+        match = CARD_RE.match(line)
+        if match and nodes(f"/dev/snd/midiC{match.group(1)}D*"):
+            cards.append((int(match.group(1)), match.group(4).strip()))
+    return cards
 
-    def __init__(self, name):
+
+class AlsaMidiOut(MidiOut):
+    """Duplex handle on the ALSA rawmidi node of one USB MIDI card."""
+
+    def __init__(self, name, card_index):
         super().__init__(name)
+        self.card_index = card_index
         self.fd = None
         self.parser = MidiParser()
 
     def open(self):
-        needle = self.name.lower()
-        cards = []
-        try:
-            with open("/proc/asound/cards") as cards_file:
-                for line in cards_file:
-                    match = CARD_RE.match(line.rstrip("\n"))
-                    if not match:
-                        continue
-                    index, _card_id, _module, long_name = match.groups()
-                    cards.append((int(index), long_name.strip()))
-        except OSError as error:
-            raise BridgeError(f"cannot list ALSA cards: {error}") from error
-        matches = [c for c in cards if needle in c[1].lower()]
-        if not matches:
-            available = ", ".join(c[1] for c in cards) or "none"
-            raise BridgeError(
-                f"no ALSA MIDI card matching {self.name!r}; available: {available}"
-            )
-        index, long_name = matches[0]
-        nodes = sorted(glob.glob(f"/dev/snd/midiC{index}D*"))
+        nodes = sorted(glob.glob(f"/dev/snd/midiC{self.card_index}D*"))
         if not nodes:
-            raise BridgeError(f"card {long_name!r} exposes no rawmidi device")
+            raise BridgeError(f"card {self.name!r} exposes no rawmidi device")
         fd = None
         try:
             fd = os.open(nodes[0], os.O_RDWR | os.O_NONBLOCK)
@@ -440,9 +448,10 @@ class RtMidiOut(MidiOut):
         self.midi_out = None
         self.midi_in = None
         self.opened = False
-        self.echo_started = None
-        self.last_echo = None
-        self.echo_warned = False
+        # Per-port client names keep alsa_client_linked unambiguous when
+        # several sequencer ports are open at once.
+        self.out_client = f"{RTMIDI_OUT_CLIENT}: {name}"
+        self.in_client = f"{RTMIDI_IN_CLIENT}: {name}"
 
     def open(self):
         if self.midi_out is None or self.midi_in is None:
@@ -450,8 +459,8 @@ class RtMidiOut(MidiOut):
                 import rtmidi  # type: ignore[import-not-found]
             except ImportError as error:
                 raise BridgeError("rtmidi backend requires python-rtmidi") from error
-            self.midi_out = rtmidi.MidiOut(name=RTMIDI_OUT_CLIENT)
-            self.midi_in = rtmidi.MidiIn(name=RTMIDI_IN_CLIENT)
+            self.midi_out = rtmidi.MidiOut(name=self.out_client)
+            self.midi_in = rtmidi.MidiIn(name=self.in_client)
 
         midi_out = self.midi_out
         midi_in = self.midi_in
@@ -491,7 +500,6 @@ class RtMidiOut(MidiOut):
                 f"cannot open sequencer port matching {self.name!r}: {error}"
             ) from error
         self.opened = True
-        self.echo_started = time.monotonic()
 
     def close(self):
         if self.midi_out is not None:
@@ -500,26 +508,19 @@ class RtMidiOut(MidiOut):
             self.midi_in.close_port()
         # RtMidi keeps its ALSA client until destruction; reuse it on retries.
         self.opened = False
-        self.echo_started = None
-        self.last_echo = None
-        self.echo_warned = False
 
     def heartbeat(self):
         # ALSA drops the subscription silently when the port's owner exits
         # (e.g. rtpmidid restarts, often under the same client number), so
         # sends would vanish without error; force a reopen instead.
         for client, direction in (
-            (RTMIDI_OUT_CLIENT, "Connecting To"),
-            (RTMIDI_IN_CLIENT, "Connected From"),
+            (self.out_client, "Connecting To"),
+            (self.in_client, "Connected From"),
         ):
             linked = alsa_client_linked(client, direction)
             if linked is not None and not linked:
                 raise BridgeError(f"MIDI port matching {self.name!r} disappeared")
         super().heartbeat()
-        since = self.last_echo if self.last_echo is not None else self.echo_started
-        if since is not None and time.monotonic() - since > ECHO_STALE_SECONDS and not self.echo_warned:
-            log("no keyboard heartbeat echo; check the iPad MIDI routes and firmware")
-            self.echo_warned = True
 
     def send(self, control, value):
         if self.midi_out is None or not self.opened:
@@ -535,74 +536,441 @@ class RtMidiOut(MidiOut):
             if event is None:
                 return messages
             message, _delta = event
-            if len(message) == 3 and message[0] == MIDI_CHANNEL and message[1:] == [CC_ECHO, PROTOCOL]:
-                self.last_echo = time.monotonic()
-                if self.echo_warned:
-                    log("keyboard heartbeat echo restored")
-                    self.echo_warned = False
-            elif len(message) == 3 and message[0] & 0xF0 in (0x80, 0x90, 0xB0):
+            if len(message) == 3 and message[0] & 0xF0 in (0x80, 0x90, 0xB0):
                 messages.append(tuple(message))
 
 
-class FallbackMidiOut(MidiOut):
-    """Use the first available destination from a pipe-separated target list."""
+class Port:
+    """A MIDI port discovery found: identity while present, name kept across replugs."""
 
-    def __init__(self, targets):
-        super().__init__(" | ".join(target.name for target in targets))
-        self.targets = targets
+    def __init__(self, key, name, factory, named=False, output_only=False):
+        self.key = key
+        self.name = name
+        self.factory = factory
+        self.named = named
+        self.output_only = output_only
+
+
+class Board:
+    """One open keyboard port and what the fleet knows about it."""
+
+    def __init__(self, port, midi, now):
+        self.key = port.key
+        self.name = port.name
+        self.named = port.named
+        self.output_only = port.output_only
+        self.midi = midi
+        self.opened_at = now
+        self.last_echo = None
+        self.echo_warned = False
+        self.sort = None
+
+    def confirmed(self, now):
+        """Running the Herdr firmware: echoing heartbeats, or unable to echo at all."""
+        if self.output_only:
+            return True
+        return self.last_echo is not None and now - self.last_echo <= ECHO_STALE_SECONDS
+
+
+def scan_alsa_ports():
+    return [
+        Port(
+            ("alsa", index, name),
+            name,
+            lambda index=index, name=name: AlsaMidiOut(name, index),
+        )
+        for index, name in alsa_midi_cards()
+    ]
+
+
+class RtMidiPortLister:
+    """Duplex sequencer port names, through one long-lived pair of clients."""
+
+    def __init__(self):
+        import rtmidi  # type: ignore[import-not-found]
+
+        self.midi_out = rtmidi.MidiOut(name=f"{RTMIDI_OUT_CLIENT}: scan")
+        self.midi_in = rtmidi.MidiIn(name=f"{RTMIDI_IN_CLIENT}: scan")
+
+    def __call__(self):
+        inputs = set(self.midi_in.get_ports())
+        return [port for port in self.midi_out.get_ports() if port in inputs]
+
+
+def rtmidi_available():
+    try:
+        import rtmidi  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def make_scanner(rtmidi_names=(), coremidi_names=()):
+    """Every port worth probing now: local keyboards plus configured rtmidi ports.
+
+    Linux finds USB keyboards as ALSA rawmidi cards. macOS lists duplex
+    CoreMIDI ports through python-rtmidi; without it, CoreMIDI names from the
+    config are driven output-only and can never claim.
+    """
+    lister = None
+    if sys.platform == "darwin" and rtmidi_available():
+        lister = RtMidiPortLister()
+
+    def scan():
+        ports = [
+            Port(("rtmidi", name), f"rtmidi:{name}", lambda name=name: RtMidiOut(name), named=True)
+            for name in rtmidi_names
+        ]
+        if lister is not None:
+            ports += [
+                Port(("rtmidi", name), name, lambda name=name: RtMidiOut(name))
+                for name in lister()
+                if not any(wanted.lower() in name.lower() for wanted in rtmidi_names)
+            ]
+        elif sys.platform == "darwin":
+            ports += [
+                Port(("coremidi", name), name, lambda name=name: CoreMidiOut(name), output_only=True)
+                for name in coremidi_names
+            ]
+        else:
+            ports += scan_alsa_ports()
+        return ports
+
+    return scan
+
+
+class KeyboardFleet(MidiOut):
+    """Every keyboard running the Herdr firmware, one of them active.
+
+    All boards mirror the same frames. Only the active board chimes and
+    supplies the slot sort mode; the others get CC_ACTIVE 0 and show standby.
+    A control note from a standby board claims it and is swallowed, so the
+    first press on a board you just picked up never acts.
+    """
+
+    def __init__(self, scan, state_dir=None, clock=time.monotonic):
+        super().__init__("keyboards")
+        self.scan = scan
+        self.state_dir = state_dir
+        self.clock = clock
+        self.boards = {}
+        self.ignored = set()  # present ports that never echoed; forgotten once gone
+        self.failures = {}
         self.active = None
+        self.provisional = True  # picked without a claim: a better-remembered board may replace it
+        self.pending = []
+        self.refresh_wanted = False
+        self.last_scan = None
+        self.status_text = None
+        self.recent = self._load_recent()
+
+    @classmethod
+    def from_config(cls, port_list, state_dir=None):
+        entries = [entry.strip() for entry in port_list.split("|") if entry.strip()]
+        rtmidi_names = [
+            entry.removeprefix("rtmidi:").strip()
+            for entry in entries
+            if entry.startswith("rtmidi:") and entry.removeprefix("rtmidi:").strip()
+        ]
+        plain = [entry for entry in entries if not entry.startswith("rtmidi:")]
+        coremidi_names = []
+        if plain and sys.platform == "darwin" and not rtmidi_available():
+            coremidi_names = plain
+        elif plain:
+            log(
+                f"ignoring {', '.join(plain)} in midi-port: "
+                "keyboards are found automatically; list only rtmidi: ports"
+            )
+        return cls(make_scanner(rtmidi_names, coremidi_names), state_dir)
+
+    # Selection -------------------------------------------------------------
+
+    def _recent_path(self):
+        return os.path.join(self.state_dir, "recent-boards") if self.state_dir else None
+
+    def _load_recent(self):
+        path = self._recent_path()
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return [line.strip() for line in handle if line.strip()]
+        except (OSError, TypeError):
+            return []
+
+    def _remember(self, name):
+        self.recent = [name] + [other for other in self.recent if other != name]
+        self.recent = self.recent[:RECENT_BOARDS_KEPT]
+        path = self._recent_path()
+        if path is None:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("".join(f"{line}\n" for line in self.recent))
+        except OSError as error:
+            log(f"cannot remember the active keyboard: {error}")
+
+    def _best(self, exclude=None):
+        now = self.clock()
+        candidates = [
+            board
+            for key, board in self.boards.items()
+            if key != exclude and board.confirmed(now)
+        ]
+        if not candidates:
+            return None
+
+        def rank(board):
+            return self.recent.index(board.name) if board.name in self.recent else len(self.recent)
+
+        return min(candidates, key=rank).key
+
+    def _activate(self, key, reason, remember):
+        board = self.boards[key]
+        changed = key != self.active
+        self.active = key
+        self.provisional = not remember
+        if remember:
+            self._remember(board.name)
+        if changed:
+            log(f"active keyboard: {board.name} ({reason})")
+            if board.sort is not None:
+                self.pending.append((MIDI_CHANNEL, CC_SORT, board.sort))
+            self.refresh_wanted = True
+            self._mark_all()
+        self._write_status()
+
+    def _settle(self):
+        """Pick an active board when there is none, or improve a provisional pick."""
+        if self.active is not None and not self.provisional:
+            return
+        best = self._best()
+        if best is None or best == self.active:
+            return
+        name = self.boards[best].name
+        self._activate(best, "last used" if name in self.recent else "first found", remember=False)
+
+    def _lose_active(self, name, why):
+        lost = self.active
+        self.active = None
+        self.provisional = True
+        successor = self._best(exclude=lost)
+        if successor is None:
+            log(f"no active keyboard: {name} {why}")
+            self._write_status()
+            return
+        # The successor stays active when the lost board returns: remember it.
+        self._activate(successor, f"{name} {why}", remember=True)
+
+    def _drop(self, key, why):
+        board = self.boards.pop(key)
+        try:
+            board.midi.close()
+        except Exception:
+            pass
+        log(f"{board.name} {why}")
+        if key == self.active:
+            self._lose_active(board.name, why)
+        self._write_status()
+
+    # Discovery -------------------------------------------------------------
 
     def open(self):
-        errors = []
-        for target in self.targets:
-            try:
-                target.open()
-                self.active = target
-                return
-            except Exception as error:
-                target.close()
-                errors.append(str(error))
-        raise BridgeError("; ".join(errors))
+        self.maintain(force=True)
 
     def close(self):
-        if self.active is not None:
-            self.active.close()
-            self.active = None
+        for key in list(self.boards):
+            board = self.boards.pop(key)
+            try:
+                board.midi.close()
+            except Exception:
+                pass
+        self.active = None
+        self.provisional = True
+
+    def maintain(self, force=False):
+        now = self.clock()
+        if not force and self.last_scan is not None and now - self.last_scan < HEARTBEAT_SECONDS:
+            return
+        self.last_scan = now
+        try:
+            ports = self.scan()
+        except Exception as error:
+            message = f"cannot list MIDI ports: {error}"
+            if self.failures.get("scan") != message:
+                log(message)
+                self.failures["scan"] = message
+            return
+        self.failures.pop("scan", None)
+        present = {port.key for port in ports}
+        for key in [key for key in self.boards if key not in present]:
+            self._drop(key, "unplugged")
+        self.ignored &= present
+        for port in ports:
+            if port.key in self.boards or port.key in self.ignored:
+                continue
+            self._probe(port, now)
+        for key, board in list(self.boards.items()):
+            self._check_echo(key, board, now)
+        self._settle()
+        self._write_status()
+
+    def _probe(self, port, now):
+        midi = None
+        try:
+            midi = port.factory()
+            midi.open()
+        except Exception as error:
+            if midi is not None:
+                try:
+                    midi.close()
+                except Exception:
+                    pass
+            message = str(error)
+            if self.failures.get(port.key) != message:
+                log(f"cannot open {port.name}: {message}")
+                self.failures[port.key] = message
+            return
+        self.failures.pop(port.key, None)
+        board = Board(port, midi, now)
+        self.boards[port.key] = board
+        if board.output_only:
+            log(f"found {board.name} (output only: it cannot echo or claim)")
+            self.refresh_wanted = True
+        self._beat(port.key, board)
+
+    def _check_echo(self, key, board, now):
+        if board.confirmed(now):
+            return
+        waited = now - (board.last_echo if board.last_echo is not None else board.opened_at)
+        if waited <= ECHO_STALE_SECONDS:
+            return
+        if board.last_echo is None and not board.named:
+            # Plain MIDI gear never answers; stop sending it heartbeats.
+            self.ignored.add(key)
+            self._drop(key, "does not echo the Herdr protocol; ignoring it")
+            return
+        if not board.echo_warned:
+            log(f"no heartbeat echo from {board.name}; check its MIDI route and firmware")
+            board.echo_warned = True
+        if key == self.active:
+            self._lose_active(board.name, "stopped echoing")
+
+    # MidiOut ---------------------------------------------------------------
+
+    def _beat(self, key, board):
+        try:
+            board.midi.heartbeat()
+        except Exception as error:
+            self._drop(key, f"failed: {error}")
+            return
+        if board.confirmed(self.clock()):
+            self._mark(key, board)
+
+    def _mark(self, key, board):
+        try:
+            board.midi.send(CC_ACTIVE, int(key == self.active))
+        except Exception as error:
+            self._drop(key, f"failed: {error}")
+
+    def _mark_all(self):
+        now = self.clock()
+        for key, board in list(self.boards.items()):
+            if key in self.boards and board.confirmed(now):
+                self._mark(key, board)
 
     def heartbeat(self):
-        if self.active is None:
-            raise BridgeError("all MIDI destinations are closed")
-        self.active.heartbeat()
+        for key, board in list(self.boards.items()):
+            if key in self.boards:
+                self._beat(key, board)
 
     def send(self, control, value):
-        if self.active is None:
-            raise BridgeError("all MIDI destinations are closed")
-        self.active.send(control, value)
+        now = self.clock()
+        for key, board in list(self.boards.items()):
+            if key not in self.boards or not board.confirmed(now):
+                continue
+            sent = value & ~CHIME_BITS if control == CC_STATE and key != self.active else value
+            try:
+                board.midi.send(control, sent)
+            except Exception as error:
+                self._drop(key, f"failed: {error}")
 
     def receive(self):
-        if self.active is None:
-            raise BridgeError("all MIDI destinations are closed")
-        return self.active.receive()
+        messages = []
+        for key, board in list(self.boards.items()):
+            if key not in self.boards:
+                continue
+            try:
+                received = board.midi.receive()
+            except Exception as error:
+                self._drop(key, f"failed: {error}")
+                continue
+            for message in received:
+                if key not in self.boards:
+                    break
+                if self._consume(key, board, message):
+                    messages.append(message)
+        messages += self.pending
+        self.pending = []
+        return messages
 
+    def _consume(self, key, board, message):
+        """Book-keep one message; True when it belongs to the controller."""
+        status, control, value = message
+        now = self.clock()
+        if status == MIDI_CHANNEL and control == CC_ECHO:
+            if value != PROTOCOL:
+                return False
+            newly = not board.confirmed(now)
+            board.last_echo = now
+            if board.echo_warned:
+                log(f"heartbeat echo from {board.name} restored")
+                board.echo_warned = False
+            if newly:
+                log(f"found {board.name}")
+                self.refresh_wanted = True
+                self._settle()
+                if key in self.boards:
+                    self._mark(key, board)
+                self._write_status()
+            return False
+        if status == MIDI_CHANNEL and control == CC_SORT:
+            board.sort = SORT_RECENCY if value == SORT_RECENCY else SORT_CRITICALITY
+            return key == self.active
+        if key == self.active:
+            return True
+        if status == NOTE_ON and value > 0:
+            # A Herdr note proves the firmware even before its first echo.
+            if board.last_echo is None:
+                board.last_echo = now
+            self._activate(key, "claimed", remember=True)
+        return False
 
-def make_midi_out(name):
-    if "|" in name:
-        targets = [
-            make_midi_out(target.strip())
-            for target in name.split("|")
-            if target.strip()
-        ]
-        if not targets:
-            raise BridgeError("MIDI target list is empty")
-        return FallbackMidiOut(targets)
-    if name.startswith("rtmidi:"):
-        target = name.removeprefix("rtmidi:").strip()
-        if not target:
-            raise BridgeError("rtmidi target is empty")
-        return RtMidiOut(target)
-    if sys.platform == "darwin":
-        return CoreMidiOut(name)
-    return AlsaMidiOut(name)
+    def take_refresh(self):
+        wanted = self.refresh_wanted
+        self.refresh_wanted = False
+        return wanted
+
+    def _write_status(self):
+        if not self.state_dir:
+            return
+        now = self.clock()
+        lines = []
+        for key, board in self.boards.items():
+            if key == self.active:
+                role = "active"
+            elif board.confirmed(now):
+                role = "standby"
+            else:
+                role = "no echo"
+            lines.append(f"{role:8} {board.name}\n")
+        text = "".join(lines) or "no keyboards found\n"
+        if text == self.status_text:
+            return
+        self.status_text = text
+        try:
+            with open(os.path.join(self.state_dir, "boards"), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError:
+            pass
 
 
 def run_herdr(*args):
@@ -1507,7 +1875,9 @@ def watch_session(socket_path, midi, tracker, controller, automation):
 
         sock.settimeout(MIDI_POLL_SECONDS)
         while True:
-            if controller.poll(midi):
+            midi.maintain()
+            sorted_changed = controller.poll(midi)
+            if midi.take_refresh() or sorted_changed:
                 automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
             while b"\n" in data:
@@ -1539,28 +1909,20 @@ def watch_session(socket_path, midi, tracker, controller, automation):
             data += chunk
 
 
-def run(socket_path, port_name):
-    midi = make_midi_out(port_name)
+def run(socket_path, port_list, state_dir=None):
+    # The fleet outlives Herdr reconnects: boards and the active choice stay put.
+    midi = KeyboardFleet.from_config(port_list, state_dir)
+    midi.open()
     tracker = Tracker()
     automation = TypeSafeAutomation()
     controller = HerdrController(tracker, automation=automation)
     last_error = None
-    midi_unavailable = True
     while True:
-        opened = False
         try:
-            midi.open()
-            opened = True
-            if midi_unavailable:
-                log(f"connected to MIDI matching {port_name!r}")
-            midi_unavailable = False
             watch_session(socket_path, midi, tracker, controller, automation)
         except (
             Exception
         ) as error:  # any failure becomes a logged retry, never a dead daemon
-            midi.close()
-            if not opened:
-                midi_unavailable = True
             message = f"{error}; reconnecting"
             if message != last_error:
                 log(message)
@@ -1741,13 +2103,13 @@ Client 131 : "Other" [User Legacy]
     fake_rtmidi.__dict__.update(MidiOut=FakeRtMidiOut, MidiIn=FakeRtMidiIn)
     sys.modules["rtmidi"] = fake_rtmidi
     try:
-        output = make_midi_out("rtmidi:HERDR-IPAD")
+        output = RtMidiOut("HERDR-IPAD")
         output.open()
         output.send(CC_HEARTBEAT, PROTOCOL)
         received = output.receive()
-        expected_messages = [(NOTE_ON, NOTE_ACCEPT, 127)]
+        # Echoes pass through: the fleet uses them to confirm the firmware.
+        expected_messages = [(MIDI_CHANNEL, CC_ECHO, PROTOCOL), (NOTE_ON, NOTE_ACCEPT, 127)]
         assert received == expected_messages
-        assert isinstance(output, RtMidiOut) and output.last_echo is not None
         output.close()
         output_instance = FakeRtMidiOut.instances[-1]
         input_instance = FakeRtMidiIn.instances[-1]
@@ -1756,7 +2118,7 @@ Client 131 : "Other" [User Legacy]
         assert output_instance.closed and input_instance.closed
 
         ports_available[0] = False
-        missing = make_midi_out("rtmidi:qmk-herdr-ipad")
+        missing = RtMidiOut("qmk-herdr-ipad")
         before = len(FakeRtMidiOut.instances)
         for _ in range(3):
             try:
@@ -1768,7 +2130,6 @@ Client 131 : "Other" [User Legacy]
         assert len(FakeRtMidiOut.instances) == before + 1
         ports_available[0] = True
         missing.open()
-        assert isinstance(missing, RtMidiOut)
         assert missing.midi_out is FakeRtMidiOut.instances[-1]
         missing.close()
     finally:
@@ -2289,12 +2650,147 @@ Client 131 : "Other" [User Legacy]
     ]
     assert failed_risk[-1] == RISK_UNKNOWN
 
-    fallback = make_midi_out("Planck EZ|rtmidi:qmk-herdr-ipad")
-    assert isinstance(fallback, FallbackMidiOut)
-    assert isinstance(
-        fallback.targets[0], CoreMidiOut if sys.platform == "darwin" else AlsaMidiOut
-    )
-    assert isinstance(fallback.targets[1], RtMidiOut)
+    cards_text = """ 0 [SoloCast       ]: USB-Audio - HyperX SoloCast
+                      HP, Inc HyperX SoloCast at usb-0000:0a:00.3-2, full speed
+ 4 [Glow           ]: USB-Audio - Planck EZ Glow
+                      ZSA Technology Labs Planck EZ Glow at usb-0000:0a:00.3-1.3.1.2, full speed
+ 5 [I              ]: USB-Audio - Moonlander Mark I
+                      ZSA Technology Labs Moonlander Mark I at usb-0000:0a:00.3-1.3.3, full speed
+"""
+    with_nodes = lambda pattern: [pattern] if pattern.startswith(("/dev/snd/midiC4", "/dev/snd/midiC5")) else []
+    assert alsa_midi_cards(cards_text, with_nodes) == [(4, "Planck EZ Glow"), (5, "Moonlander Mark I")]
+
+    class FakeBoard(MidiOut):
+        """A keyboard port: Herdr firmware echoes heartbeats, other gear stays silent."""
+
+        def __init__(self, name, herdr=True, sort=None):
+            super().__init__(name)
+            self.herdr = herdr
+            self.sort = sort
+            self.sent = []
+            self.inbox = []
+            self.closed = False
+
+        def open(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def send(self, control, value):
+            if self.closed:
+                raise BridgeError("gone")
+            self.sent.append((control, value))
+            if control == CC_HEARTBEAT and self.herdr:
+                self.inbox.append((MIDI_CHANNEL, CC_ECHO, PROTOCOL))
+                if self.sort is not None:
+                    self.inbox.append((MIDI_CHANNEL, CC_SORT, self.sort))
+
+        def receive(self):
+            messages, self.inbox = self.inbox, []
+            return messages
+
+        def marks(self):
+            return [value for control, value in self.sent if control == CC_ACTIVE]
+
+    now = [100.0]
+    boards = {
+        "Moonlander Mark I": FakeBoard("Moonlander Mark I"),
+        "Planck EZ Glow": FakeBoard("Planck EZ Glow", sort=SORT_RECENCY),
+        "Synth": FakeBoard("Synth", herdr=False),
+    }
+    plugged = list(boards)
+    opened = []
+
+    def fake_scan():
+        def factory(name):
+            opened.append(name)
+            return boards[name]
+
+        return [Port(("alsa", name), name, lambda name=name: factory(name)) for name in plugged]
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as state_dir:
+        with open(os.path.join(state_dir, "recent-boards"), "w") as handle:
+            handle.write("Planck EZ Glow\n")
+        fleet = KeyboardFleet(fake_scan, state_dir, clock=lambda: now[0])
+        fleet.open()
+        assert all(board.sent[0] == (CC_HEARTBEAT, PROTOCOL) for board in boards.values())
+        assert fleet.active is None
+        # Echoes confirm Herdr boards; the remembered Planck wins over the first found.
+        assert fleet.receive() == [(MIDI_CHANNEL, CC_SORT, SORT_RECENCY)]
+        assert fleet.active == ("alsa", "Planck EZ Glow") and fleet.provisional
+        assert fleet.take_refresh() and not fleet.take_refresh()
+        assert boards["Planck EZ Glow"].marks()[-1] == 1
+        assert boards["Moonlander Mark I"].marks()[-1] == 0
+        assert boards["Synth"].marks() == []
+
+        # Frames reach confirmed boards only; chimes reach the active board only.
+        fleet.send(CC_STATE, STATUS_CODES["done"] | CHIME_BITS)
+        assert boards["Planck EZ Glow"].sent[-1] == (CC_STATE, STATUS_CODES["done"] | CHIME_BITS)
+        assert boards["Moonlander Mark I"].sent[-1] == (CC_STATE, STATUS_CODES["done"])
+        assert (CC_STATE, STATUS_CODES["done"]) not in boards["Synth"].sent
+
+        # Silent gear is dropped after the echo window and not probed again.
+        for _ in range(int(ECHO_STALE_SECONDS) + 1):
+            now[0] += HEARTBEAT_SECONDS
+            fleet.heartbeat()
+            fleet.receive()
+            fleet.maintain()
+        assert fleet.active == ("alsa", "Planck EZ Glow")
+        assert ("alsa", "Synth") not in fleet.boards and boards["Synth"].closed
+        now[0] += HEARTBEAT_SECONDS
+        fleet.maintain()
+        assert opened.count("Synth") == 1
+
+        # A standby board's sort mode is held back; its control note claims it and is swallowed.
+        boards["Moonlander Mark I"].sort = SORT_CRITICALITY
+        fleet.heartbeat()
+        passed = fleet.receive()
+        assert passed == [(MIDI_CHANNEL, CC_SORT, SORT_RECENCY)], passed
+        boards["Moonlander Mark I"].inbox.append((NOTE_ON, NOTE_ACCEPT, 127))
+        claimed = fleet.receive()
+        assert claimed == [(MIDI_CHANNEL, CC_SORT, SORT_CRITICALITY)], claimed
+        assert fleet.active == ("alsa", "Moonlander Mark I") and not fleet.provisional
+        with open(os.path.join(state_dir, "recent-boards")) as handle:
+            assert handle.read().splitlines() == ["Moonlander Mark I", "Planck EZ Glow"]
+        assert boards["Moonlander Mark I"].marks()[-1] == 1
+        assert boards["Planck EZ Glow"].marks()[-1] == 0
+        with open(os.path.join(state_dir, "boards")) as handle:
+            assert handle.read() == "active   Moonlander Mark I\nstandby  Planck EZ Glow\n"
+
+        # The active board's notes pass through; the standby board's are dropped.
+        boards["Moonlander Mark I"].inbox.append((NOTE_ON, NOTE_TAB_NEXT, 127))
+        boards["Planck EZ Glow"].inbox.append((NOTE_OFF, NOTE_ACCEPT, 0))
+        assert fleet.receive() == [(NOTE_ON, NOTE_TAB_NEXT, 127)]
+
+        # Unplugging the active board promotes the other; it stays active when the first returns.
+        plugged.remove("Moonlander Mark I")
+        now[0] += HEARTBEAT_SECONDS
+        fleet.maintain()
+        assert fleet.active == ("alsa", "Planck EZ Glow") and not fleet.provisional
+        plugged.append("Moonlander Mark I")
+        now[0] += HEARTBEAT_SECONDS
+        fleet.maintain()
+        fleet.receive()
+        assert fleet.active == ("alsa", "Planck EZ Glow")
+        assert boards["Moonlander Mark I"].marks()[-1] == 0
+
+        # An active board that stops echoing hands over to one that still does.
+        boards["Planck EZ Glow"].herdr = False
+        now[0] += ECHO_STALE_SECONDS + 1
+        fleet.heartbeat()
+        fleet.receive()
+        fleet.maintain()
+        assert fleet.active == ("alsa", "Moonlander Mark I")
+
+        # A board that fails mid-send is dropped instead of breaking the session.
+        boards["Moonlander Mark I"].closed = True
+        fleet.send(CC_RISK, RISK_NONE)
+        assert ("alsa", "Moonlander Mark I") not in fleet.boards
+        assert fleet.active is None
+        fleet.close()
     print("self-test ok")
 
 
@@ -2306,7 +2802,11 @@ def main():
     if not socket_path:
         log("HERDR_SOCKET_PATH is missing; run qmk-herdr inside a Herdr pane")
         sys.exit(1)
-    run(socket_path, sys.argv[1] if len(sys.argv) > 1 else "Moonlander|Planck EZ")
+    run(
+        socket_path,
+        sys.argv[1] if len(sys.argv) > 1 else "",
+        os.environ.get("HERDR_PLUGIN_STATE_DIR"),
+    )
 
 
 if __name__ == "__main__":

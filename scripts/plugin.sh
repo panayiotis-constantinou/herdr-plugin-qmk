@@ -77,6 +77,7 @@ stop)
 status)
   if running; then
     echo "qmk-herdr is running (pid $pid)"
+    [ ! -s "$state_dir/boards" ] || cat "$state_dir/boards"
   else
     echo "qmk-herdr is stopped"
     [ ! -s "$logfile" ] || tail -n 20 "$logfile"
