@@ -43,6 +43,7 @@ CC_STATE = 111
 CC_SLOT_FIRST = 112
 CC_ECHO = 116  # returned by the keyboard after each protocol heartbeat
 CC_RISK = 117  # approval risk for the focused blocked agent
+CC_SORT = 118  # from the keyboard with each echo: its slot sort mode
 ECHO_STALE_SECONDS = 5.0
 NOTE_WORKSPACE_NEW = 116
 NOTE_TAB_NEW = 117
@@ -101,8 +102,12 @@ BLOCKED_REASONS = {
     ),
     "other": "None of the above clearly fits",
 }
+# Keyboard slot sort modes; firmware that never sends CC_SORT gets criticality.
+SORT_CRITICALITY = 0
+SORT_RECENCY = 1
 # Slot CC bits 3-4; zero means unknown and keeps the plain blocked blink.
 REASON_CODES = {"permission": 1, "question": 2, "error": 3}
+# Slot CC bits 5-6 carry the agent's color index, unique among the slots.
 APPROVAL_RISKS = [
     "The pending action only reads or inspects: viewing files, searching, "
     "listing, or read-only commands",
@@ -828,7 +833,7 @@ class TypeSafeAutomation:
             )
         )
 
-    def _scores_for(self, agents):
+    def scores_for(self, agents):
         if self.score_key != self._ranking_key(agents) or any(
             agent["pane_id"] not in self.slot_scores for agent in agents
         ):
@@ -836,7 +841,7 @@ class TypeSafeAutomation:
         return self.slot_scores
 
     def attention_order(self, agents):
-        scores = self._scores_for(agents)
+        scores = self.scores_for(agents)
         if not agents or not scores:
             return None
         return [
@@ -995,7 +1000,7 @@ class TypeSafeAutomation:
         frame = tracker.update(
             self.agents,
             notify=notify,
-            scores=self._scores_for(self.agents),
+            scores=self.scores_for(self.agents),
             blocked=self.blocked,
         )
         self._schedule_ranking(self.agents)
@@ -1016,6 +1021,16 @@ class TypeSafeAutomation:
             if transition["to"] == "done"
         )
         self.chime_due = self.clock() + TYPESAFE_CHIME_DEBOUNCE_SECONDS
+
+    def refresh(self, midi, tracker):
+        """Resend the last agents' frame after a new ranking, judgement, or sort."""
+        frame = tracker.update(
+            self.agents,
+            notify=False,
+            scores=self.scores_for(self.agents),
+            blocked=self.blocked,
+        )
+        tracker.send_frame(midi, frame)
 
     def _flush_chime(self):
         if self.chime_due is None or self.clock() < self.chime_due:
@@ -1055,7 +1070,7 @@ class TypeSafeAutomation:
         frame = tracker.update(
             self.agents,
             notify=False,
-            scores=self._scores_for(self.agents),
+            scores=self.scores_for(self.agents),
             blocked=self.blocked,
         )
 
@@ -1102,13 +1117,7 @@ class TypeSafeAutomation:
                 scores[pane_id] = self._number(answer.get("score"))
         self.slot_scores = scores
         self.score_key = context["key"]
-        frame = tracker.update(
-            self.agents,
-            notify=False,
-            scores=self._scores_for(self.agents),
-            blocked=self.blocked,
-        )
-        tracker.send_frame(midi, frame)
+        self.refresh(midi, tracker)
 
     def _apply_blocked(self, midi, tracker, context, answers, error):
         info = self.blocked.get(context["pane_id"])
@@ -1135,13 +1144,7 @@ class TypeSafeAutomation:
             elif self._number(risk.get("confidence")) >= TYPESAFE_MIN_CONFIDENCE:
                 level = round(self._number(risk.get("score")))
                 info["risk"] = RISK_LEVELS[max(0, min(level, len(RISK_LEVELS) - 1))]
-        frame = tracker.update(
-            self.agents,
-            notify=False,
-            scores=self._scores_for(self.agents),
-            blocked=self.blocked,
-        )
-        tracker.send_frame(midi, frame)
+        self.refresh(midi, tracker)
 
     def poll(self, midi, tracker):
         self._flush_chime()
@@ -1299,7 +1302,13 @@ class HerdrController:
                 ]
                 self.command("agent", "focus", panes[0])
                 return True
-            panes = panes or [agent["pane_id"] for agent in agents]
+            # Next and Previous walk the keyboard's slot order.
+            scores = (
+                self.automation.scores_for(agents)
+                if self.automation is not None
+                else {}
+            )
+            panes = self.tracker.order(agents, scores)
             focused = self._focused_pane()["pane_id"]
             if focused in panes:
                 delta = 1 if control == NOTE_AGENT_NEXT else -1
@@ -1321,7 +1330,16 @@ class HerdrController:
         return True
 
     def poll(self, midi):
+        """Run keyboard controls; True when the keyboard changed its sort mode."""
+        sorted_changed = False
         for status, control, value in midi.receive():
+            if status == MIDI_CHANNEL and control == CC_SORT:
+                sort = SORT_RECENCY if value == SORT_RECENCY else SORT_CRITICALITY
+                if sort != self.tracker.sort:
+                    self.tracker.sort = sort
+                    sorted_changed = True
+                    log(f"slots sorted by {'recency' if sort else 'criticality'}")
+                continue
             if status == NOTE_OFF:
                 value = 0
             elif status != NOTE_ON:
@@ -1331,30 +1349,40 @@ class HerdrController:
                     log(f"control note {control}")
             except Exception as error:
                 log(f"control note {control} failed: {error}")
+        return sorted_changed
 
 
 class Tracker:
     def __init__(self):
         self.slots = [None] * SLOT_COUNT
+        self.colors = {}
+        self.sort = SORT_CRITICALITY
         self.previous = {}
 
-    def update(self, agents, notify, scores=None, blocked=None):
+    def order(self, agents, scores=None):
+        """Pane ids in the keyboard's sort mode, first slot first."""
         scores = scores or {}
-        blocked = blocked or {}
-        agents = sorted(
-            agents,
-            key=lambda agent: (
-                -STATUS_RANK.get(agent["agent_status"], 0),
+        if self.sort == SORT_RECENCY:
+            key = lambda agent: (-agent.get("state_change_seq", 0), agent["pane_id"])
+        else:
+            key = lambda agent: (
+                -STATUS_RANK.get(agent.get("agent_status"), 0),
                 -scores.get(agent["pane_id"], 0),
                 agent.get("state_change_seq", 0),
                 agent["pane_id"],
-            ),
-        )
-        wanted = [agent["pane_id"] for agent in agents[:SLOT_COUNT]]
-        self.slots = [slot if slot in wanted else None for slot in self.slots]
+            )
+        return [agent["pane_id"] for agent in sorted(agents, key=key)]
+
+    def update(self, agents, notify, scores=None, blocked=None):
+        blocked = blocked or {}
+        wanted = self.order(agents, scores)[:SLOT_COUNT]
+        self.slots = wanted + [None] * (SLOT_COUNT - len(wanted))
+        # Each agent on the board keeps its own color until it leaves.
+        self.colors = {s: c for s, c in self.colors.items() if s in wanted}
         for pane_id in wanted:
-            if pane_id not in self.slots:
-                self.slots[self.slots.index(None)] = pane_id
+            if pane_id not in self.colors:
+                free = set(range(SLOT_COUNT)) - set(self.colors.values())
+                self.colors[pane_id] = min(free)
 
         current = {a["pane_id"]: a["agent_status"] for a in agents}
         transitions = [
@@ -1376,6 +1404,7 @@ class Tracker:
                 (
                     STATUS_CODES.get(current[s], EMPTY_SLOT)
                     | (blocked.get(s, {}).get("reason", 0) << 3)
+                    | (self.colors[s] << 5)
                     if s is not None
                     else EMPTY_SLOT
                 )
@@ -1478,7 +1507,8 @@ def watch_session(socket_path, midi, tracker, controller, automation):
 
         sock.settimeout(MIDI_POLL_SECONDS)
         while True:
-            controller.poll(midi)
+            if controller.poll(midi):
+                automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
@@ -1547,7 +1577,7 @@ def self_test():
         ],
         notify=False,
     )
-    assert first["slots"] == [1, 0, EMPTY_SLOT, EMPTY_SLOT], first
+    assert first["slots"] == [1, 0 | 1 << 5, EMPTY_SLOT, EMPTY_SLOT], first
     assert not first["chime_done"]
 
     second = tracker.update(
@@ -1557,7 +1587,8 @@ def self_test():
         ],
         notify=True,
     )
-    assert second["slots"] == [3, 2, EMPTY_SLOT, EMPTY_SLOT], second
+    # The blocked agent moves first and both keep their colors.
+    assert second["slots"] == [2 | 1 << 5, 3, EMPTY_SLOT, EMPTY_SLOT], second
     assert second["aggregate"] == "blocked"
     assert second["chime_done"] and second["chime_blocked"], second
 
@@ -1568,7 +1599,21 @@ def self_test():
         ],
         notify=True,
     )
-    assert overflow["overflow"] and overflow["slots"] == [0, 0, 0, 0], overflow
+    assert overflow["overflow"], overflow
+    assert overflow["slots"] == [1 << 5, 0, 2 << 5, 3 << 5], overflow
+    assert tracker.slots == ["p1", "p2", "p3", "p4"]
+
+    tracker.sort = SORT_RECENCY
+    recent = tracker.update(
+        [
+            {"pane_id": f"p{i}", "agent_status": "idle", "state_change_seq": i}
+            for i in range(1, 6)
+        ],
+        notify=False,
+    )
+    assert tracker.slots == ["p5", "p4", "p3", "p2"]
+    assert recent["slots"] == [1 << 5, 3 << 5, 2 << 5, 0], recent
+    tracker.sort = SORT_CRITICALITY
 
     request = subscription_request([{"pane_id": "w1:p1"}])
     assert request.count(b'"type"') == 4
@@ -1825,9 +1870,39 @@ Client 131 : "Other" [User Legacy]
             ]
 
     commands.clear()
-    controller.poll(FakeControlMidi())
+    assert not controller.poll(FakeControlMidi())
     expected = [("agent", "send-keys", "w1:p1", "enter")]
     assert commands == expected, commands
+
+    class FakeSortMidi:
+        def receive(self):
+            return [(MIDI_CHANNEL, CC_ECHO, PROTOCOL), (MIDI_CHANNEL, CC_SORT, 1)]
+
+    def recency_herdr(*args):
+        if args == ("agent", "list"):
+            return {
+                "agents": [
+                    {
+                        "pane_id": "w1:p1",
+                        "agent_status": "blocked",
+                        "state_change_seq": 3,
+                    },
+                    {"pane_id": "w1:p2", "agent_status": "idle", "state_change_seq": 2},
+                    {"pane_id": "w2:p3", "agent_status": "idle", "state_change_seq": 1},
+                ]
+            }
+        return fake_herdr(*args)
+
+    sort_tracker = Tracker()
+    sort_controller = HerdrController(sort_tracker, command=recency_herdr)
+    assert sort_controller.handle(NOTE_AGENT_NEXT, 127)
+    assert commands[-1] == ("agent", "focus", "w2:p3"), "criticality: p1, p3, p2"
+    assert sort_controller.poll(FakeSortMidi()) and sort_tracker.sort == SORT_RECENCY
+    assert not sort_controller.poll(FakeSortMidi()), "unchanged mode needs no frame"
+    assert sort_controller.handle(NOTE_AGENT_NEXT, 127)
+    assert commands[-1] == ("agent", "focus", "w1:p2"), "recency: p1, p2, p3"
+    assert sort_controller.handle(NOTE_AGENT_URGENT, 127)
+    assert commands[-1] == ("agent", "focus", "w1:p1"), "urgent ignores recency"
 
     class ImmediateFuture:
         def __init__(self, function, arguments):

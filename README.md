@@ -46,7 +46,7 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 - **Choice** caches implementation, review, research, planning, operations, documentation, or general role tags when agent metadata changes. Roles improve routing and attention ranking but never alter agent state.
 - **Noul** batches nearby completed-agent transitions and decides whether one sound is useful. Blocked-agent sounds remain deterministic and immediate.
 - **Blocked agents** get one request per blocked episode: a Choice of why the agent is waiting (permission prompt, question, or error) and a Score of how risky approving it is. The keyboard blinks each blocked slot in a rhythm for its reason, and colors Accept green, peach, or red for the focused agent's permission prompt; high risk makes Accept need a double tap. Any real chance of a destructive action counts as high risk even when TypeSafe is unsure.
-- **Score** maintains an attention order from agent task metadata. It breaks same-status LED-slot ties and makes note 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
+- **Score** maintains an attention order from agent task metadata. While slots are sorted by criticality, it breaks same-status LED-slot ties and makes note 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
 
 Requests include agent metadata such as pane ID, project path, title, and status. The only terminal output sent is the last 40 lines of a **blocked** agent (`herdr agent read --source recent`), once per blocked episode; clipboard text and the output of agents that are not blocked are never sent. Without an API key, or when ranking fails, existing local behavior continues; completion-chime failures use the deterministic fallback after the two-second request timeout.
 
@@ -79,9 +79,9 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 A running plugin or a bridge log saying `connected to MIDI` only proves the local MIDI endpoint opened. It does **not** prove the RTP peer, iPad routing, or keyboard is connected. The matching firmware echoes each protocol heartbeat as CC 116 value 2 on channel 15; `no keyboard heartbeat echo` in the bridge log means the end-to-end round trip has been absent for five seconds. The warning clears when echoes resume; the bridge does not repeatedly restart a healthy local MIDI port to compensate for a sleeping iPad.
 
 1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect the host if the iPad initiated the session, leave the iPad's own session enabled, and check that the contact uses the host's Tailscale address and port `5004`; the host's next retry (every 30 seconds) should then connect.
-2. With the Planck connected to the iPad, enable both midimittr routes. Its bottom-center LED should leave disconnected red when matching heartbeats arrive (enable RGB first).
+2. With the Planck connected to the iPad, enable both midimittr routes. Its bottom-center LED should turn from dim red to dim green when matching heartbeats arrive (enable RGB first).
 3. In a disposable Herdr workspace, use previous/next tab on the keyboard's Herdr layer. The remote session must change tabs: this checks the return path, not just LED output.
-4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck should turn red and stop the spinner within five seconds, and the bridge should warn after five seconds. Restore the route and check for `keyboard heartbeat echo restored`.
+4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck's bottom-center LED should turn red and its slot LEDs go dark within five seconds, and the bridge should warn after five seconds. Restore the route and check for `keyboard heartbeat echo restored`.
 5. Repeat after locking/unlocking the iPad, changing Wi-Fi/cellular, unplugging/replugging the Planck, and restarting rtpmidid. After each recovery, verify both LED updates **and** a harmless previous/next tab action; if either fails, check Tailscale, the RTP-MIDI session, and both midimittr routes.
 
 ## Develop
@@ -126,10 +126,10 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 
 ## Keyboard display
 
-- Six center Planck EZ LEDs, or the six innermost covered Moonlander keys: orange comet while any agent is working.
-- Planck EZ bottom-center LED: red disconnected, amber blocked, blue working, green done, dim white idle, bright white unknown/overflow.
-- Four Planck EZ outer-bottom LEDs: stable status-prioritized slots; TypeSafe can rank same-status agents by attention value.
-- Caps Lock, Scroll Lock, and mouse-jiggler indicators return when the spinner is idle.
+- Planck EZ bottom-center LED (Moonlander: past the jiggler indicator): dim green connected, dim red disconnected.
+- Four Planck EZ outer-bottom LEDs (Moonlander: left number row): the first four agents in the keyboard's sort mode, first on the left. Criticality order puts blocked before working, done, unknown, and idle, and TypeSafe can rank same-status agents by attention value; recency order puts the latest state change first. Previous/next agent (notes 110/122) walk the same order; most urgent (note 111) always follows criticality.
+- Each agent on the board gets its own color (blue, green, peach, or mauve) and keeps it while it stays there. Idle is dim, working breathes, blocked blinks in a rhythm for its reason, done is bright, and unknown shows white.
+- Sort-mode LEDs (Planck EZ: the small LEDs below the space bar; Moonlander: the first small LED on each half): left lit for criticality, right lit for recency, both dark while disconnected. Toggle the mode with the top-left key of the Herdr layer.
 - The keyboard speaker always cues connection and blocked transitions; TypeSafe can suppress low-value done cues.
 
 The keyboard stops the working animation if bridge heartbeats time out.
@@ -138,7 +138,7 @@ The keyboard stops the working animation if bridge heartbeats time out.
 
 The matching Miryoku firmware lives in the [QMK fork](https://github.com/panayiotis-constantinou/qmk_firmware) under `keyboards/zsa/planck_ez/keymaps/manna-harbour_miryoku` and the equivalent Moonlander keymap. The local Panix checkout is `~/Projects/qmk_firmware`; shared protocol handling is in `users/manna-harbour_miryoku/herdr.c`. Uncommitted firmware changes must be included in the build; a stock/Oryx image does not implement this protocol. Per-key RGB requires the Planck EZ **Glow** variant.
 
-Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots (bits 0–2 status, bits 3–4 blocked reason: 0 unknown, 1 permission, 2 question, 3 error), and CC 117 carries the focused agent's approval risk (0 none, 1 pending, 2 unknown, 3–5 low/medium/high). Older firmware ignores the extra bits and CC 117. The firmware returns CC 116 value 2 as a round-trip receipt. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
+Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots (bits 0–2 status, bits 3–4 blocked reason: 0 unknown, 1 permission, 2 question, 3 error, bits 5–6 the agent's color index), and CC 117 carries the focused agent's approval risk (0 none, 1 pending, 2 unknown, 3–5 low/medium/high). Older firmware ignores the extra bits and CC 117. The firmware returns CC 116 value 2 as a round-trip receipt, followed by CC 118 with its sort mode (0 criticality, 1 recency), also sent when the mode is toggled; without CC 118 the bridge sorts by criticality. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
 
 Build both with:
 
