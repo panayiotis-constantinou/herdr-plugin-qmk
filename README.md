@@ -138,6 +138,27 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 
 The keyboard stops the working animation if bridge heartbeats time out.
 
+## Colors in Herdr
+
+The bridge marks each agent on the board with a `●` in its keyboard color, published as pane metadata tokens `$qmk_blue`, `$qmk_green`, `$qmk_peach`, and `$qmk_mauve` (source `qmk-herdr`). Herdr styles tokens per occurrence, not per value, so each agent carries exactly one of the four and the others are cleared. Agents off the board carry none. Marks expire after 30 seconds unless the bridge refreshes them, so a stopped bridge leaves no stale colors.
+
+Add the tokens to a sidebar row with the firmware's Catppuccin hues:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  [
+    { token = "$qmk_blue", fg = "#89b4fa", bold = true },
+    { token = "$qmk_green", fg = "#a6e3a1", bold = true },
+    { token = "$qmk_peach", fg = "#fab387", bold = true },
+    { token = "$qmk_mauve", fg = "#cba6f7", bold = true },
+    "workspace",
+    "tab"
+  ],
+  ["state_icon", "agent"],
+]
+```
+
 ## Firmware
 
 The matching Miryoku firmware lives in the [QMK fork](https://github.com/panayiotis-constantinou/qmk_firmware) under `keyboards/zsa/planck_ez/keymaps/manna-harbour_miryoku` and the equivalent Moonlander keymap. The local Panix checkout is `~/Projects/qmk_firmware`; shared protocol handling is in `users/manna-harbour_miryoku/herdr.c`. Uncommitted firmware changes must be included in the build; a stock/Oryx image does not implement this protocol. Per-key RGB requires the Planck EZ **Glow** variant.

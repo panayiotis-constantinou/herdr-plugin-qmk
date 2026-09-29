@@ -79,6 +79,14 @@ TYPESAFE_RISK_HIGH_PROBABILITY = 0.3
 BLOCKED_TAIL_LINES = 40
 TYPESAFE_API_URL = "https://api.typesafe.ai/v1/systemone"
 MIDI_PACKET_DATA_SIZE = 256
+METADATA_SOURCE = "qmk-herdr"
+# Herdr styles sidebar tokens per token, not per value, so each keyboard color
+# gets its own token and an agent carries only the one for its color.
+COLOR_TOKENS = ["qmk_blue", "qmk_green", "qmk_peach", "qmk_mauve"]
+COLOR_MARK = "●"
+# Marks expire unless refreshed, so a stopped bridge leaves no stale colors.
+COLOR_TTL_MS = 30_000
+COLOR_REFRESH_SECONDS = 10.0
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
 STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
@@ -1808,25 +1816,78 @@ class Tracker:
         midi.send(CC_STATE, value)
 
 
-def snapshot(socket_path):
-    request = json.dumps(
-        {"id": "qmk-herdr-snapshot", "method": "session.snapshot", "params": {}}
-    ).encode()
+def herdr_request(socket_path, method, params):
+    """Send one socket API request on its own connection and return its result."""
+    request = json.dumps({"id": "qmk-herdr", "method": method, "params": params})
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(HEARTBEAT_SECONDS)
         sock.connect(socket_path)
-        sock.sendall(request + b"\n")
+        sock.sendall(request.encode() + b"\n")
         data = b""
         while b"\n" not in data:
             chunk = sock.recv(4096)
             if not chunk:
-                raise BridgeError("snapshot connection closed")
+                raise BridgeError(f"{method} connection closed")
             data += chunk
+    try:
+        response = json.loads(data.split(b"\n", 1)[0])
+    except ValueError as error:
+        raise BridgeError(f"malformed {method} response: {error}") from error
+    if "error" in response:
+        error = response["error"]
+        raise BridgeError(f"{method} failed: {error.get('code')}: {error.get('message')}")
+    return response.get("result")
+
+
+def snapshot(socket_path):
+    result = herdr_request(socket_path, "session.snapshot", {})
+    try:
+        return result["snapshot"]["agents"]
+    except (KeyError, TypeError) as error:
+        raise BridgeError(f"malformed snapshot response: {error}") from error
+
+
+class ColorMarks:
+    """Mark each agent on the board in Herdr with its keyboard color."""
+
+    def __init__(self, socket_path, request=herdr_request, clock=time.monotonic):
+        self.socket_path = socket_path
+        self.request = request
+        self.clock = clock
+        self.shown = {}
+        self.refreshed = None
+
+    def sync(self, colors):
+        now = self.clock()
+        due = self.refreshed is None or now - self.refreshed >= COLOR_REFRESH_SECONDS
+        if not due and colors == self.shown:
+            return
+        for pane_id in self.shown.keys() - colors.keys():
+            self._report(pane_id, None)
+        for pane_id, color in colors.items():
+            if due or self.shown.get(pane_id) != color:
+                self._report(pane_id, color)
+        self.shown = dict(colors)
+        if due:
+            self.refreshed = now
+
+    def _report(self, pane_id, color):
+        params = {
+            "pane_id": pane_id,
+            "source": METADATA_SOURCE,
+            "tokens": {
+                token: COLOR_MARK if index == color else None
+                for index, token in enumerate(COLOR_TOKENS)
+            },
+        }
+        if color is not None:
+            params["ttl_ms"] = COLOR_TTL_MS
         try:
-            response = json.loads(data.split(b"\n", 1)[0])
-            return response["result"]["snapshot"]["agents"]
-        except (ValueError, KeyError, TypeError) as error:
-            raise BridgeError(f"malformed snapshot response: {error}") from error
+            self.request(self.socket_path, "pane.report_metadata", params)
+        except (BridgeError, OSError) as error:
+            # A pane that just closed has nothing left to mark.
+            if "pane_not_found" not in str(error):
+                log(f"color mark for {pane_id} failed: {error}")
 
 
 def subscription_request(agents):
@@ -1845,6 +1906,8 @@ def subscription_request(agents):
 
 
 def watch_session(socket_path, midi, tracker, controller, automation):
+    # A fresh connection re-marks every agent, covering a restarted Herdr.
+    marks = ColorMarks(socket_path)
     initial = snapshot(socket_path)
     subscribed = {a["pane_id"] for a in initial}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -1880,6 +1943,7 @@ def watch_session(socket_path, midi, tracker, controller, automation):
             if midi.take_refresh() or sorted_changed:
                 automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
+            marks.sync(tracker.colors)
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
                 if not line.strip():
@@ -1976,6 +2040,46 @@ def self_test():
     assert tracker.slots == ["p5", "p4", "p3", "p2"]
     assert recent["slots"] == [1 << 5, 3 << 5, 2 << 5, 0], recent
     tracker.sort = SORT_CRITICALITY
+
+    # Herdr marks follow the keyboard colors: new and recolored agents get one
+    # token, departed agents lose theirs, and every mark is refreshed on time.
+    reports = []
+    marks_now = [0.0]
+
+    def fake_report(socket_path, method, params):
+        assert method == "pane.report_metadata" and params["source"] == METADATA_SOURCE
+        reports.append(params)
+        if params["pane_id"] == "gone":
+            raise BridgeError("pane.report_metadata failed: pane_not_found: gone")
+
+    def marked(params):
+        return [t for t, v in params["tokens"].items() if v == COLOR_MARK]
+
+    marks = ColorMarks("sock", request=fake_report, clock=lambda: marks_now[0])
+    marks.sync(dict(tracker.colors))
+    assert {r["pane_id"]: marked(r) for r in reports} == {
+        "p5": ["qmk_green"],
+        "p4": ["qmk_mauve"],
+        "p3": ["qmk_peach"],
+        "p2": ["qmk_blue"],
+    }, reports
+    assert all(len(r["tokens"]) == len(COLOR_TOKENS) for r in reports)
+    assert all(r["ttl_ms"] == COLOR_TTL_MS for r in reports)
+    reports.clear()
+    marks.sync(dict(tracker.colors))
+    assert reports == []
+    marks.sync({"p5": 1, "p4": 0, "gone": 2})
+    assert {r["pane_id"]: marked(r) for r in reports} == {
+        "p3": [],
+        "p2": [],
+        "p4": ["qmk_blue"],
+        "gone": ["qmk_peach"],
+    }, reports
+    assert all("ttl_ms" not in r for r in reports if r["pane_id"] in ("p3", "p2"))
+    reports.clear()
+    marks_now[0] += COLOR_REFRESH_SECONDS
+    marks.sync({"p5": 1, "p4": 0})
+    assert sorted(r["pane_id"] for r in reports) == ["gone", "p4", "p5"], reports
 
     request = subscription_request([{"pane_id": "w1:p1"}])
     assert request.count(b'"type"') == 4
