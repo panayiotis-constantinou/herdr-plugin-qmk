@@ -80,13 +80,14 @@ BLOCKED_TAIL_LINES = 40
 TYPESAFE_API_URL = "https://api.typesafe.ai/v1/systemone"
 MIDI_PACKET_DATA_SIZE = 256
 METADATA_SOURCE = "qmk-herdr"
-# Herdr styles sidebar tokens per token, not per value, so each keyboard color
-# gets its own token and an agent carries only the one for its color.
+# Herdr styles sidebar tokens per token, not per value, so the agent name goes
+# in the token for its keyboard color, or the plain one for agents off the board.
 COLOR_TOKENS = ["qmk_blue", "qmk_green", "qmk_peach", "qmk_mauve"]
-COLOR_MARK = "●"
-# Marks expire unless refreshed, so a stopped bridge leaves no stale colors.
-COLOR_TTL_MS = 30_000
-COLOR_REFRESH_SECONDS = 10.0
+PLAIN_TOKEN = "qmk_agent"
+NAME_TOKENS = COLOR_TOKENS + [PLAIN_TOKEN]
+# Names expire unless refreshed, so a stopped bridge leaves no stale colors.
+NAME_TTL_MS = 30_000
+NAME_REFRESH_SECONDS = 10.0
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
 STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
@@ -1847,8 +1848,8 @@ def snapshot(socket_path):
         raise BridgeError(f"malformed snapshot response: {error}") from error
 
 
-class ColorMarks:
-    """Mark each agent on the board in Herdr with its keyboard color."""
+class AgentNames:
+    """Publish each agent's name to Herdr in its keyboard color."""
 
     def __init__(self, socket_path, request=herdr_request, clock=time.monotonic):
         self.socket_path = socket_path
@@ -1857,37 +1858,48 @@ class ColorMarks:
         self.shown = {}
         self.refreshed = None
 
-    def sync(self, colors):
+    @staticmethod
+    def wanted(agents, colors):
+        """pane_id -> (token, name) with the same label as Herdr's agent field."""
+        names = {}
+        for agent in agents:
+            name = agent.get("display_agent") or agent.get("agent")
+            if name:
+                color = colors.get(agent["pane_id"])
+                token = PLAIN_TOKEN if color is None else COLOR_TOKENS[color]
+                names[agent["pane_id"]] = (token, name)
+        return names
+
+    def sync(self, agents, colors):
+        wanted = self.wanted(agents, colors)
         now = self.clock()
-        due = self.refreshed is None or now - self.refreshed >= COLOR_REFRESH_SECONDS
-        if not due and colors == self.shown:
+        due = self.refreshed is None or now - self.refreshed >= NAME_REFRESH_SECONDS
+        if not due and wanted == self.shown:
             return
-        for pane_id in self.shown.keys() - colors.keys():
+        for pane_id in self.shown.keys() - wanted.keys():
             self._report(pane_id, None)
-        for pane_id, color in colors.items():
-            if due or self.shown.get(pane_id) != color:
-                self._report(pane_id, color)
-        self.shown = dict(colors)
+        for pane_id, shown in wanted.items():
+            if due or self.shown.get(pane_id) != shown:
+                self._report(pane_id, shown)
+        self.shown = wanted
         if due:
             self.refreshed = now
 
-    def _report(self, pane_id, color):
+    def _report(self, pane_id, shown):
+        token, name = shown or (None, None)
         params = {
             "pane_id": pane_id,
             "source": METADATA_SOURCE,
-            "tokens": {
-                token: COLOR_MARK if index == color else None
-                for index, token in enumerate(COLOR_TOKENS)
-            },
+            "tokens": {t: name if t == token else None for t in NAME_TOKENS},
         }
-        if color is not None:
-            params["ttl_ms"] = COLOR_TTL_MS
+        if shown is not None:
+            params["ttl_ms"] = NAME_TTL_MS
         try:
             self.request(self.socket_path, "pane.report_metadata", params)
         except (BridgeError, OSError) as error:
-            # A pane that just closed has nothing left to mark.
+            # A pane that just closed has no name left to show.
             if "pane_not_found" not in str(error):
-                log(f"color mark for {pane_id} failed: {error}")
+                log(f"agent name for {pane_id} failed: {error}")
 
 
 def subscription_request(agents):
@@ -1905,9 +1917,8 @@ def subscription_request(agents):
     ).encode()
 
 
-def watch_session(socket_path, midi, tracker, controller, automation):
-    # A fresh connection re-marks every agent, covering a restarted Herdr.
-    marks = ColorMarks(socket_path)
+def watch_session(socket_path, midi, tracker, controller, automation, names=None):
+    names = names or AgentNames(socket_path)
     initial = snapshot(socket_path)
     subscribed = {a["pane_id"] for a in initial}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -1943,7 +1954,7 @@ def watch_session(socket_path, midi, tracker, controller, automation):
             if midi.take_refresh() or sorted_changed:
                 automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
-            marks.sync(tracker.colors)
+            names.sync(automation.agents, tracker.colors)
             while b"\n" in data:
                 line, data = data.split(b"\n", 1)
                 if not line.strip():
@@ -1981,9 +1992,12 @@ def run(socket_path, port_list, state_dir=None):
     automation = TypeSafeAutomation()
     controller = HerdrController(tracker, automation=automation)
     last_error = None
+    # Names outlive resubscribes so agents that left get cleared; the periodic
+    # refresh republishes them all after a Herdr restart.
+    names = AgentNames(socket_path)
     while True:
         try:
-            watch_session(socket_path, midi, tracker, controller, automation)
+            watch_session(socket_path, midi, tracker, controller, automation, names)
         except (
             Exception
         ) as error:  # any failure becomes a logged retry, never a dead daemon
@@ -2041,45 +2055,56 @@ def self_test():
     assert recent["slots"] == [1 << 5, 3 << 5, 2 << 5, 0], recent
     tracker.sort = SORT_CRITICALITY
 
-    # Herdr marks follow the keyboard colors: new and recolored agents get one
-    # token, departed agents lose theirs, and every mark is refreshed on time.
+    # Agent names follow the keyboard colors: each agent carries its name in
+    # exactly one token, agents off the board get the plain one, departed
+    # agents are cleared, and every name is refreshed on time.
     reports = []
-    marks_now = [0.0]
+    names_now = [0.0]
 
     def fake_report(socket_path, method, params):
         assert method == "pane.report_metadata" and params["source"] == METADATA_SOURCE
+        assert set(params["tokens"]) == set(NAME_TOKENS)
         reports.append(params)
         if params["pane_id"] == "gone":
             raise BridgeError("pane.report_metadata failed: pane_not_found: gone")
 
-    def marked(params):
-        return [t for t, v in params["tokens"].items() if v == COLOR_MARK]
+    def shown():
+        return {
+            r["pane_id"]: {t: v for t, v in r["tokens"].items() if v is not None}
+            for r in reports
+        }
 
-    marks = ColorMarks("sock", request=fake_report, clock=lambda: marks_now[0])
-    marks.sync(dict(tracker.colors))
-    assert {r["pane_id"]: marked(r) for r in reports} == {
-        "p5": ["qmk_green"],
-        "p4": ["qmk_mauve"],
-        "p3": ["qmk_peach"],
-        "p2": ["qmk_blue"],
+    named = [
+        {"pane_id": f"p{i}", "agent": "claude" if i != 1 else "pi"}
+        for i in range(1, 6)
+    ]
+    named[2]["display_agent"] = "reviewer"
+    names = AgentNames("sock", request=fake_report, clock=lambda: names_now[0])
+    names.sync(named, dict(tracker.colors))
+    assert shown() == {
+        "p1": {"qmk_agent": "pi"},
+        "p2": {"qmk_blue": "claude"},
+        "p3": {"qmk_peach": "reviewer"},
+        "p4": {"qmk_mauve": "claude"},
+        "p5": {"qmk_green": "claude"},
     }, reports
-    assert all(len(r["tokens"]) == len(COLOR_TOKENS) for r in reports)
-    assert all(r["ttl_ms"] == COLOR_TTL_MS for r in reports)
+    assert all(r["ttl_ms"] == NAME_TTL_MS for r in reports)
     reports.clear()
-    marks.sync(dict(tracker.colors))
+    names.sync(named, dict(tracker.colors))
     assert reports == []
-    marks.sync({"p5": 1, "p4": 0, "gone": 2})
-    assert {r["pane_id"]: marked(r) for r in reports} == {
-        "p3": [],
-        "p2": [],
-        "p4": ["qmk_blue"],
-        "gone": ["qmk_peach"],
+    moved = named[:1] + named[3:] + [{"pane_id": "gone", "agent": "claude"}]
+    names.sync(moved, {"p5": 1, "p4": 0, "gone": 2})
+    assert shown() == {
+        "p2": {},
+        "p3": {},
+        "p4": {"qmk_blue": "claude"},
+        "gone": {"qmk_peach": "claude"},
     }, reports
-    assert all("ttl_ms" not in r for r in reports if r["pane_id"] in ("p3", "p2"))
+    assert all("ttl_ms" not in r for r in reports if r["pane_id"] in ("p2", "p3"))
     reports.clear()
-    marks_now[0] += COLOR_REFRESH_SECONDS
-    marks.sync({"p5": 1, "p4": 0})
-    assert sorted(r["pane_id"] for r in reports) == ["gone", "p4", "p5"], reports
+    names_now[0] += NAME_REFRESH_SECONDS
+    names.sync(moved[:-1], {"p5": 1, "p4": 0})
+    assert sorted(r["pane_id"] for r in reports) == ["gone", "p1", "p4", "p5"], reports
 
     request = subscription_request([{"pane_id": "w1:p1"}])
     assert request.count(b'"type"') == 4

@@ -140,24 +140,26 @@ The keyboard stops the working animation if bridge heartbeats time out.
 
 ## Colors in Herdr
 
-The bridge marks each agent on the board with a `●` in its keyboard color, published as pane metadata tokens `$qmk_blue`, `$qmk_green`, `$qmk_peach`, and `$qmk_mauve` (source `qmk-herdr`). Herdr styles tokens per occurrence, not per value, so each agent carries exactly one of the four and the others are cleared. Agents off the board carry none. Marks expire after 30 seconds unless the bridge refreshes them, so a stopped bridge leaves no stale colors.
+The bridge publishes each agent's name, the same label as Herdr's built-in `agent` field, as pane metadata (source `qmk-herdr`). Agents on the board carry it in the token for their keyboard color, `$qmk_blue`, `$qmk_green`, `$qmk_peach`, or `$qmk_mauve`; agents off the board carry it in `$qmk_agent`. Herdr styles tokens per occurrence, not per value, so each agent carries exactly one of the five and the others are cleared. Names expire after 30 seconds unless the bridge refreshes them, so a stopped bridge leaves no stale colors.
 
-Add the tokens to a sidebar row with the firmware's Catppuccin hues:
+Put the five tokens where the built-in `agent` would go, with the firmware's Catppuccin hues:
 
 ```toml
 [ui.sidebar.agents]
 rows = [
+  ["workspace", "tab"],
   [
-    { token = "$qmk_blue", fg = "#89b4fa", bold = true },
-    { token = "$qmk_green", fg = "#a6e3a1", bold = true },
-    { token = "$qmk_peach", fg = "#fab387", bold = true },
-    { token = "$qmk_mauve", fg = "#cba6f7", bold = true },
-    "workspace",
-    "tab"
+    "state_icon",
+    { token = "$qmk_blue", fg = "#89b4fa" },
+    { token = "$qmk_green", fg = "#a6e3a1" },
+    { token = "$qmk_peach", fg = "#fab387" },
+    { token = "$qmk_mauve", fg = "#cba6f7" },
+    "$qmk_agent"
   ],
-  ["state_icon", "agent"],
 ]
 ```
+
+Without the bridge running, this row shows no agent names; keep the built-in `agent` on machines without a keyboard.
 
 ## Firmware
 
