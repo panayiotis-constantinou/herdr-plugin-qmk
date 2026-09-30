@@ -43,6 +43,9 @@ NOTE_AGENT_URGENT = 111
 NOTE_PANE_CLOSE = 112  # the firmware only sends closes after a double tap
 NOTE_TAB_CLOSE = 113
 NOTE_WORKSPACE_CLOSE = 114
+NOTE_PANE_SPLIT = 115
+TAP_VELOCITY = 127
+HOLD_VELOCITY = 64  # a key held past the tapping term: its variant, if any
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
@@ -1585,8 +1588,9 @@ class HerdrController:
         self.command(kind, "focus", target)
 
     def handle(self, control, value):
-        if value != 127:
+        if value not in (TAP_VELOCITY, HOLD_VELOCITY):
             return False
+        held = value == HOLD_VELOCITY
         if control in (NOTE_WORKSPACE_PREV, NOTE_WORKSPACE_NEXT):
             self._cycle(
                 "workspace",
@@ -1613,11 +1617,21 @@ class HerdrController:
             pane = self._focused_pane()
             self.command(
                 "pane",
-                "focus",
+                "swap" if held else "focus",
                 "--direction",
                 directions[control],
                 "--pane",
                 pane["pane_id"],
+            )
+        elif control == NOTE_PANE_SPLIT:
+            pane = self._focused_pane()
+            self.command(
+                "pane",
+                "split",
+                pane["pane_id"],
+                "--direction",
+                "down" if held else "right",
+                "--focus",
             )
         elif control == NOTE_AGENT_PICKER:
             self.command(
@@ -1630,6 +1644,9 @@ class HerdrController:
         elif control == NOTE_WORKSPACE_NEW:
             pane = self._focused_pane()
             self.command("workspace", "create", "--cwd", pane["cwd"], "--focus")
+        elif control == NOTE_TAB_NEW and held:
+            pane = self._focused_pane()
+            self.command("pane", "move", pane["pane_id"], "--new-tab", "--focus")
         elif control == NOTE_TAB_NEW:
             pane = self._focused_pane()
             self.command(
@@ -1643,7 +1660,12 @@ class HerdrController:
             )
         elif control == NOTE_LAZYGIT:
             self.command(
-                "plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"
+                "plugin",
+                "action",
+                "invoke",
+                "open-tab" if held else "open",
+                "--plugin",
+                "herdr-lazygit",
             )
         elif control in (NOTE_PALETTE, NOTE_SMART_ACTION):
             self.command(
@@ -2457,6 +2479,27 @@ Client 131 : "Other" [User Legacy]
         ("agent", "send-keys", "w1:p1", "ctrl+c"),
     ]
     assert all(command in commands for command in expected_commands)
+
+    # Holds pick each key's variant; keys without one treat a hold as a tap.
+    commands.clear()
+    for control, velocity in (
+        (NOTE_PANE_SPLIT, TAP_VELOCITY),
+        (NOTE_PANE_LEFT, HOLD_VELOCITY),
+        (NOTE_TAB_NEW, HOLD_VELOCITY),
+        (NOTE_LAZYGIT, HOLD_VELOCITY),
+        (NOTE_PANE_SPLIT, HOLD_VELOCITY),
+        (NOTE_ACCEPT, HOLD_VELOCITY),
+    ):
+        assert controller.handle(control, velocity)
+    assert commands == [
+        ("pane", "split", "w1:p1", "--direction", "right", "--focus"),
+        ("pane", "swap", "--direction", "left", "--pane", "w1:p1"),
+        ("pane", "move", "w1:p1", "--new-tab", "--focus"),
+        ("plugin", "action", "invoke", "open-tab", "--plugin", "herdr-lazygit"),
+        ("pane", "split", "w1:p1", "--direction", "down", "--focus"),
+        ("agent", "send-keys", "w1:p1", "enter"),
+    ], commands
+    assert not controller.handle(NOTE_PANE_SPLIT, 1), "unknown velocities are ignored"
 
     class FakeControlMidi:
         def receive(self):

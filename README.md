@@ -69,7 +69,7 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 
 Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. A LAN-only peer address will not work away from home. iPadOS may suspend network or MIDI apps in the background; verify recovery after locking the screen and changing networks rather than assuming background operation.
 
-Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–114 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 3 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
+Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–127 (except 123) on channel 15 instead of F13–F24, and only counts protocol 3 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
 
@@ -102,13 +102,13 @@ The process log is `qmk-herdr.log` under `HERDR_PLUGIN_STATE_DIR`; Herdr exposes
 
 ## Keyboard controls
 
-The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note Off is ignored. Notes avoid CC 100/101 (RPN select) and CC 120–127 (channel mode messages), which MIDI routers may filter or act on. Status still goes to the keyboard as CC 110–115.
+The bridge uses MIDI channel 15 and dispatches Note On with velocity `127` for a tap or `64` for a hold past the tapping term, which picks the variant listed below (other notes treat a hold as a tap); Note Off is ignored. Notes avoid CC 100/101 (RPN select) and CC 120–127 (channel mode messages), which MIDI routers may filter or act on. Status still goes to the keyboard as CC 110–115.
 
 | Note | Action |
 | ---: | --- |
 | 100–101 | Focus previous/next workspace, wrapping by displayed number |
 | 102–103 | Focus previous/next tab in the focused workspace, wrapping by displayed number |
-| 104–107 | Focus the pane left/down/up/right of the focused pane |
+| 104–107 | Focus the pane left/down/up/right of the focused pane; held, swap the focused pane that way |
 | 108 | Open the Lancodev Jump workspace/agent picker |
 | 109 | Toggle the Herdr Floax floating scratch shell |
 | 110 | Focus the previous live agent in the same order as note 122 |
@@ -116,9 +116,10 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note
 | 112 | Close the focused pane (the firmware sends it only on a double tap) |
 | 113 | Close the focused tab (double tap) |
 | 114 | Close the focused workspace (double tap) |
+| 115 | Split the focused pane to the right; held, split it downward |
 | 116 | Create and focus a workspace rooted at the focused pane's directory |
-| 117 | Create and focus a tab in the focused workspace and directory |
-| 118 | Toggle LazyGit in a split pane |
+| 117 | Create and focus a tab in the focused workspace and directory; held, move the focused pane into a new tab |
+| 118 | Toggle LazyGit in a split pane; held, in its own tab |
 | 119 | Open the plugin command palette |
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
