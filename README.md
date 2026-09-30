@@ -6,6 +6,7 @@ A Herdr plugin that mirrors agent state on a QMK keyboard and turns the keyboard
 
 - One or more QMK keyboards exposing USB MIDI, connected to the host or to the iPad via a duplex RTP-MIDI bridge.
 - Linux talks to each keyboard's `/dev/snd/midiC*D*` rawmidi node (granted to the active seat user by default).
+- Python 3.11+ is required for reading Herdr's TOML config.
 - macOS finds keyboards through `python-rtmidi`; without it, it can only send status to CoreMIDI destinations named in `midi-port`, which cannot claim. `python3` ships with the Xcode Command Line Tools; override the interpreter with `HERDR_QMK_PYTHON` if needed.
 - The optional `rtmidi:` backend requires `python-rtmidi`; USB operation on Linux remains dependency-free. Set `HERDR_QMK_PYTHON`, or write the Python executable path to the plugin config file named `python`.
 
@@ -21,7 +22,7 @@ Restart Herdr after installing so the startup hook runs.
 
 The bridge finds keyboards on its own: every second it looks for USB MIDI keyboards (ALSA cards on Linux, duplex CoreMIDI ports on macOS) and sends each new one a heartbeat. Ports that answer with the Herdr echo within five seconds are kept; other MIDI gear is left alone until it is unplugged. Every keyboard mirrors the same slots, risk, and connection state, so any of them is safe to pick up.
 
-One keyboard is **active**: it plays the chimes, its sort mode orders the slots, and previous/next agent follow its order. The others are **standby**, and matching firmware shows that with a dim blue connection LED. To switch, press any Herdr control on a standby keyboard: that first press only makes it active and does nothing else, so it can never approve or reject on stale state. The Sort and Sound toggles stay local and never switch.
+One keyboard is **active**: it plays the chimes and can toggle Herdr's panel between Priority and Grouped. All keyboards mirror the panel's mode and first four agents; previous/next walks the full panel order. The others are **standby**, shown with a dim blue connection LED. To switch, press any Herdr control on a standby keyboard: that first press only makes it active and does nothing else, so it can never approve or reject on stale state. Sort on a standby keyboard only claims it, like any control; Sound stays local and never claims a board.
 
 The bridge remembers the last active keyboard across restarts in `recent-boards` under the plugin state directory. If the active keyboard is unplugged or stops echoing, the most recently used remaining keyboard takes over, and the first one stays standby when it returns. `herdr plugin action invoke status --plugin panayiotis.qmk-herdr` lists the keyboards and marks the active one.
 
@@ -50,7 +51,7 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 - **Choice** caches implementation, review, research, planning, operations, documentation, or general role tags when agent metadata changes. Roles improve routing and attention ranking but never alter agent state.
 - **Noul** batches nearby completed-agent transitions and decides whether one sound is useful. Blocked-agent sounds remain deterministic and immediate.
 - **Blocked agents** get one request per blocked episode: a Choice of why the agent is waiting (permission prompt, question, or error) and a Score of how risky approving it is. The keyboard blinks each blocked slot in a rhythm for its reason, and colors Accept green, peach, or red for the focused agent's permission prompt; high risk makes Accept need a double tap. Any real chance of a destructive action counts as high risk even when TypeSafe is unsure.
-- **Score** maintains an attention order from agent task metadata. While slots are sorted by criticality, it breaks same-status LED-slot ties and makes note 122 visit the most useful agent next; status priority and the no-TypeSafe order remain deterministic.
+- **Score** maintains an attention order for the most-urgent-agent key only. It never overrides panel/LED order or previous/next navigation.
 
 Requests include agent metadata such as pane ID, project path, title, and status. The only terminal output sent is the last 40 lines of a **blocked** agent (`herdr agent read --source recent`), once per blocked episode; clipboard text and the output of agents that are not blocked are never sent. Without an API key, or when ranking fails, existing local behavior continues; completion-chime failures use the deterministic fallback after the two-second request timeout.
 
@@ -68,7 +69,7 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 
 Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. A LAN-only peer address will not work away from home. iPadOS may suspend network or MIDI apps in the background; verify recovery after locking the screen and changing networks rather than assuming background operation.
 
-Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–111 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 2 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
+Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–111 and 116–127 on channel 15 instead of F13–F24, and only counts protocol 3 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
 
 Useful actions:
 
@@ -80,7 +81,7 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 
 ### Verify the complete path
 
-An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not** prove the RTP peer, iPad routing, or keyboard is connected. The matching firmware echoes each protocol heartbeat as CC 116 value 2 on channel 15, and the bridge logs `found rtmidi:…` on the first echo; `no heartbeat echo from rtmidi:…` means the end-to-end round trip has been absent for five seconds. The warning clears when echoes resume; the bridge does not repeatedly restart a healthy local MIDI port to compensate for a sleeping iPad.
+An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not** prove the RTP peer, iPad routing, or keyboard is connected. The matching firmware echoes each protocol heartbeat as CC 116 value 3 on channel 15, and the bridge logs `found rtmidi:…` on the first echo; `no heartbeat echo from rtmidi:…` means the end-to-end round trip has been absent for five seconds. The warning clears when echoes resume; the bridge does not repeatedly restart a healthy local MIDI port to compensate for a sleeping iPad.
 
 1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect the host if the iPad initiated the session, leave the iPad's own session enabled, and check that the contact uses the host's Tailscale address and port `5004`; the host's next retry (every 30 seconds) should then connect.
 2. With the Planck connected to the iPad, enable both midimittr routes. Its space bar LED should turn from dim red to dim green when matching heartbeats arrive (enable RGB first).
@@ -92,6 +93,7 @@ An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not
 
 ```sh
 python3 scripts/bridge.py --self-test
+python3 scripts/test_panel_sort.py
 herdr plugin link --enabled .
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
@@ -117,7 +119,7 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127`; Note
 | 119 | Open the plugin command palette |
 | 120 | Toggle zoom for the focused pane |
 | 121 | Open the worktree diff in a Hunk tab |
-| 122 | Focus the next live agent in TypeSafe attention order, or Herdr's list order without a confident ranking |
+| 122 | Focus the next live agent in Herdr's built-in panel order |
 | 123 | Open the command palette (sent by older firmware; current firmware uses 119) |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
@@ -131,12 +133,20 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 ## Keyboard display
 
 - Planck EZ space bar LED (Moonlander: the right's spare key beside K): dim green for the active keyboard, dim blue for a standby one, dim red disconnected.
-- Four agent slots (Planck EZ: the center block's top two rows, top left first; Moonlander: the left's spare column beside the index finger, top to bottom): the first four agents in the keyboard's sort mode. Criticality order puts blocked before working, done, unknown, and idle, and TypeSafe can rank same-status agents by attention value; recency order puts the latest state change first. Previous/next agent (notes 110/122) walk the same order; most urgent (note 111) always follows criticality.
-- Each agent on the board gets its own color (blue, green, peach, or mauve) and keeps it while it stays there. Idle is dim, working breathes, blocked blinks in a rhythm for its reason, done is bright, and unknown shows white.
-- Sort mode on one RGB LED (Planck EZ: the center block's bottom left; Moonlander: the right's innermost number-row key): dim yellow for criticality, dim teal for recency, dark while disconnected. A standby keyboard shows its own mode; the active keyboard's mode orders the slots. Toggle the mode with the top-left key of the Herdr layer.
+- Four agent slots (Planck EZ: the center block's top two rows, top left first; Moonlander: the left's spare column beside the index finger, top to bottom): the first four agent entries in Herdr's built-in panel order, excluding group headers. Priority puts blocked, done, working, idle, then unknown first, with newest state changes first within each status and stable layout-order ties. Grouped follows workspace/tab/pane layout order. Previous/next (notes 110/122) walks the full list; most urgent (111) retains its independent urgency/AI behavior.
+- Each agent on the board gets its own color (blue, green, peach, or mauve) and keeps it while it stays there. Idle is dim, working breathes, blocked blinks in a rhythm for its reason, done is bright, and unknown is steady at half brightness in its assigned color.
+- Sort mode on one RGB LED (Planck EZ: the inner bottom-left LED 37, with Scroll Lock moved to center-block LED 29; Moonlander: the right's innermost number-row key): dim yellow for Priority, dim teal for Grouped, dark while disconnected. All boards mirror Herdr. The active board's top-left Herdr-layer key requests a toggle; LEDs change only when the bridge acknowledges it.
 - The active keyboard's speaker always cues blocked transitions, and every keyboard cues its own connection; TypeSafe can suppress low-value done cues.
 
 The keyboard stops the working animation if bridge heartbeats time out.
+
+## Sorting synchronization
+
+The bridge watches `HERDR_CONFIG_PATH` (default `~/.config/herdr/config.toml`). Herdr's panel toggle persists `ui.agent_panel_sort`; keyboard toggles atomically update that setting and call `herdr server reload-config`. On reconnect Herdr's saved mode wins. Reloading config reapplies other saved settings too. A config shared by multiple Herdr sessions shares the persisted mode.
+
+The config must be writable and not a symlink. Panix's Home Manager activation converts its generated config into a writable file and preserves only the panel-sort preference across generations. Invalid configs and failed reloads are reported; the keyboard does not invent an independent mode. A keyboard toggle also clears any agent view, such as a `herdr-projects focus`, because a view hides the panel sort. A view set elsewhere cannot be read back, so the keyboard keeps showing the panel's own order until the view is cleared.
+
+Protocol 3 is required on **both** bridge and keyboards: protocol 2 boards are deliberately not considered connected, avoiding old heartbeat sort echoes overwriting Herdr's mode. Do not restart the new bridge until the new firmware has been flashed.
 
 ## Colors in Herdr
 
@@ -165,7 +175,7 @@ Without the bridge running, this row shows no agent names; keep the built-in `ag
 
 The matching Miryoku firmware lives in the [QMK fork](https://github.com/panayiotis-constantinou/qmk_firmware) under `keyboards/zsa/planck_ez/keymaps/manna-harbour_miryoku` and the equivalent Moonlander keymap. The local Panix checkout is `~/Projects/qmk_firmware`; shared protocol handling is in `users/manna-harbour_miryoku/herdr.c`. Uncommitted firmware changes must be included in the build; a stock/Oryx image does not implement this protocol. Per-key RGB requires the Planck EZ **Glow** variant.
 
-Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 2 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots (bits 0–2 status, bits 3–4 blocked reason: 0 unknown, 1 permission, 2 question, 3 error, bits 5–6 the agent's color index), and CC 117 carries the focused agent's approval risk (0 none, 1 pending, 2 unknown, 3–5 low/medium/high). Older firmware ignores the extra bits and CC 117. The firmware returns CC 116 value 2 as a round-trip receipt, followed by CC 118 with its sort mode (0 criticality, 1 recency), also sent when the mode is toggled; without CC 118 the bridge sorts by criticality. After each heartbeat the bridge sends CC 119: 1 to the active keyboard, 0 to standby ones, whose CC 111 carries no chime flags. Older firmware ignores CC 119 and stays green; the bridge still swallows its claiming press. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
+Status uses MIDI channel 15 CC messages, not SysEx: CC 110 value 3 is the heartbeat, CC 111 carries the aggregate state/flags, and CC 112–115 carry the four agent slots (bits 0–2 status, bits 3–4 blocked reason: 0 unknown, 1 permission, 2 question, 3 error, bits 5–6 the agent's color index), and CC 117 carries the focused agent's approval risk (0 none, 1 pending, 2 unknown, 3–5 low/medium/high). Older firmware ignores the extra bits and CC 117. The firmware returns CC 116 value 3 as a round-trip receipt. CC 118 is duplex: the bridge sends the current mode (0 Priority, 1 Grouped) to all boards, and a keyboard sends only toggle requests, never heartbeat echoes. The active keyboard's request changes the mode; a standby keyboard's only claims it. Mirroring mode updates does not write EEPROM. After each heartbeat the bridge sends CC 119: 1 to the active keyboard, 0 to standby ones, whose CC 111 carries no chime flags. Older firmware ignores CC 119 and stays green; the bridge still swallows its claiming press. The firmware renders RGB and plays speaker cues locally; the server does not stream audio over MIDI.
 
 Build both with:
 

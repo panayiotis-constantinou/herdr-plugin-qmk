@@ -18,7 +18,9 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 import types
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -43,7 +45,7 @@ CC_STATE = 111
 CC_SLOT_FIRST = 112
 CC_ECHO = 116  # returned by the keyboard after each protocol heartbeat
 CC_RISK = 117  # approval risk for the focused blocked agent
-CC_SORT = 118  # from the keyboard with each echo: its slot sort mode
+CC_SORT = 118  # both ways: Herdr's panel mode to every board, toggle requests back
 CC_ACTIVE = 119  # to the keyboard with each heartbeat: 1 active, 0 standby
 CHIME_BITS = 0b1100000  # CC_STATE done/blocked chime flags: active board only
 ECHO_STALE_SECONDS = 5.0
@@ -60,7 +62,7 @@ NOTE_ACCEPT = 124
 NOTE_REJECT = 125
 NOTE_PROMPT = 126
 NOTE_CLEAR = 127
-PROTOCOL = 2
+PROTOCOL = 3
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
 HEARTBEAT_SECONDS = 1.0
@@ -114,9 +116,9 @@ BLOCKED_REASONS = {
     ),
     "other": "None of the above clearly fits",
 }
-# Keyboard slot sort modes; firmware that never sends CC_SORT gets criticality.
-SORT_CRITICALITY = 0
-SORT_RECENCY = 1
+# Herdr's built-in agent panel modes, as CC_SORT values (protocol 3).
+SORT_PRIORITY = 0
+SORT_GROUPED = 1
 # Slot CC bits 3-4; zero means unknown and keeps the plain blocked blink.
 REASON_CODES = {"permission": 1, "question": 2, "error": 3}
 # Slot CC bits 5-6 carry the agent's color index, unique among the slots.
@@ -572,7 +574,6 @@ class Board:
         self.opened_at = now
         self.last_echo = None
         self.echo_warned = False
-        self.sort = None
 
     def confirmed(self, now):
         """Running the Herdr firmware: echoing heartbeats, or unable to echo at all."""
@@ -651,9 +652,9 @@ def make_scanner(rtmidi_names=(), coremidi_names=()):
 class KeyboardFleet(MidiOut):
     """Every keyboard running the Herdr firmware, one of them active.
 
-    All boards mirror the same frames. Only the active board chimes and
-    supplies the slot sort mode; the others get CC_ACTIVE 0 and show standby.
-    A control note from a standby board claims it and is swallowed, so the
+    All boards mirror the same frames, including Herdr's panel sort mode.
+    Only the active board chimes and can change the sort. A control note or
+    sort request from a standby board claims it and is swallowed, so the
     first press on a board you just picked up never acts.
     """
 
@@ -741,8 +742,6 @@ class KeyboardFleet(MidiOut):
             self._remember(board.name)
         if changed:
             log(f"active keyboard: {board.name} ({reason})")
-            if board.sort is not None:
-                self.pending.append((MIDI_CHANNEL, CC_SORT, board.sort))
             self.refresh_wanted = True
             self._mark_all()
         self._write_status()
@@ -941,12 +940,9 @@ class KeyboardFleet(MidiOut):
                     self._mark(key, board)
                 self._write_status()
             return False
-        if status == MIDI_CHANNEL and control == CC_SORT:
-            board.sort = SORT_RECENCY if value == SORT_RECENCY else SORT_CRITICALITY
-            return key == self.active
         if key == self.active:
             return True
-        if status == NOTE_ON and value > 0:
+        if (status == NOTE_ON and value > 0) or (status == MIDI_CHANNEL and control == CC_SORT):
             # A Herdr note proves the firmware even before its first echo.
             if board.last_echo is None:
                 board.last_echo = now
@@ -1711,11 +1707,11 @@ class HerdrController:
         sorted_changed = False
         for status, control, value in midi.receive():
             if status == MIDI_CHANNEL and control == CC_SORT:
-                sort = SORT_RECENCY if value == SORT_RECENCY else SORT_CRITICALITY
+                sort = SORT_GROUPED if value == SORT_GROUPED else SORT_PRIORITY
                 if sort != self.tracker.sort:
                     self.tracker.sort = sort
                     sorted_changed = True
-                    log(f"slots sorted by {'recency' if sort else 'criticality'}")
+                    log(f"panel sorted by {'grouped' if sort else 'priority'}")
                 continue
             if status == NOTE_OFF:
                 value = 0
@@ -1729,26 +1725,106 @@ class HerdrController:
         return sorted_changed
 
 
+class PanelSort:
+    """Sync Herdr's persisted built-in sort without owning an agent-view override."""
+
+    def __init__(self, tracker, path=None, reload=None, clear_view=None):
+        self.tracker = tracker
+        self.path = path or os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser("~/.config/herdr/config.toml")
+        self.reload = reload or (lambda: run_herdr("server", "reload-config"))
+        self.clear_view = clear_view or (lambda: None)
+        self.stamp = None
+        self.mode = SORT_PRIORITY
+
+    def request(self):
+        """Apply the keyboard's requested mode and show it."""
+        self.write()
+        # Any agent view (say a herdr-projects focus) hides the panel sort,
+        # so a keyboard request drops it; a failed write leaves it alone.
+        self.clear_view()
+
+    def read(self):
+        stamp = os.stat(self.path)
+        if stamp != self.stamp:
+            with open(self.path, "rb") as handle:
+                mode = tomllib.load(handle).get("ui", {}).get("agent_panel_sort", "spaces")
+            if mode not in ("priority", "spaces", "workspaces"):
+                raise BridgeError(f"unsupported Herdr panel sort: {mode}")
+            self.mode = SORT_PRIORITY if mode == "priority" else SORT_GROUPED
+            self.stamp = stamp
+        changed = self.mode != self.tracker.sort
+        self.tracker.sort = self.mode
+        return changed
+
+    def write(self):
+        if os.path.islink(self.path):
+            raise BridgeError("Herdr config is a symlink; activate Panix's writable config first")
+        stamp = os.stat(self.path)
+        with open(self.path, encoding="utf-8") as handle:
+            content = handle.read()
+        mode = "spaces" if self.tracker.sort == SORT_GROUPED else "priority"
+        # Only edit the [ui] section, preserving unrelated settings and comments.
+        section = re.search(r"(?ms)^\[ui\][^\n]*\n.*?(?=^\s*\[|\Z)", content)
+        setting = f'agent_panel_sort = "{mode}"'
+        if section:
+            body = section.group()
+            if re.search(r"(?m)^\s*agent_panel_sort\s*=", body):
+                body = re.sub(r"(?m)^(\s*agent_panel_sort\s*=\s*)[^\n#]*(.*)$", lambda m: m[1] + f'"{mode}" ' + m[2], body)
+            else:
+                body = body.rstrip() + "\n" + setting + "\n\n"
+            updated = content[:section.start()] + body + content[section.end():]
+        else:
+            updated = content.rstrip() + "\n\n[ui]\n" + setting + "\n"
+        tomllib.loads(updated)  # Never replace a valid config with invalid TOML.
+        if updated == content:
+            return
+        fd, temp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.path)))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp, stamp.st_mode & 0o777)
+            if os.stat(self.path) != stamp:
+                raise BridgeError("Herdr config changed concurrently; retry the toggle")
+            os.replace(temp, self.path)
+            written = os.stat(self.path)
+            try:
+                result = self.reload()
+                if isinstance(result, dict) and result.get("status") == "failed":
+                    raise BridgeError(f"Herdr config reload failed: {result}")
+            except Exception:
+                # Restore only our write, never clobber a concurrent edit.
+                if os.stat(self.path) == written:
+                    fd, temp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.path)))
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(content)
+                    os.chmod(temp, stamp.st_mode & 0o777)
+                    os.replace(temp, self.path)
+                raise
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+
 class Tracker:
     def __init__(self):
         self.slots = [None] * SLOT_COUNT
         self.colors = {}
-        self.sort = SORT_CRITICALITY
+        self.sort = SORT_PRIORITY
         self.previous = {}
 
     def order(self, agents, scores=None):
-        """Pane ids in the keyboard's sort mode, first slot first."""
-        scores = scores or {}
-        if self.sort == SORT_RECENCY:
-            key = lambda agent: (-agent.get("state_change_seq", 0), agent["pane_id"])
-        else:
-            key = lambda agent: (
-                -STATUS_RANK.get(agent.get("agent_status"), 0),
-                -scores.get(agent["pane_id"], 0),
-                agent.get("state_change_seq", 0),
-                agent["pane_id"],
-            )
-        return [agent["pane_id"] for agent in sorted(agents, key=key)]
+        """Pane ids in Herdr's built-in panel order, first slot first."""
+        # Herdr's list already has workspace/tab/layout order. Stable sorting
+        # preserves that order for priority ties. AI scores never reorder slots.
+        if self.sort == SORT_GROUPED:
+            return [agent["pane_id"] for agent in agents]
+        priority = {"blocked": 4, "done": 3, "working": 2, "idle": 1, "unknown": 0}
+        return [agent["pane_id"] for agent in sorted(agents, key=lambda agent: (
+            -priority.get(agent.get("agent_status"), 0),
+            -agent.get("state_change_seq", 0),
+        ))]
 
     def update(self, agents, notify, scores=None, blocked=None):
         blocked = blocked or {}
@@ -1806,6 +1882,7 @@ class Tracker:
 
     def send_frame(self, midi, frame):
         midi.heartbeat()
+        midi.send(CC_SORT, self.sort)
         for index, status in enumerate(frame["slots"]):
             midi.send(CC_SLOT_FIRST + index, status)
         midi.send(CC_RISK, frame["risk"])
@@ -1919,6 +1996,10 @@ def subscription_request(agents):
 
 def watch_session(socket_path, midi, tracker, controller, automation, names=None):
     names = names or AgentNames(socket_path)
+    panel_sort = PanelSort(
+        tracker, clear_view=lambda: herdr_request(socket_path, "agent.view.clear", {})
+    )
+    panel_sort.read()
     initial = snapshot(socket_path)
     subscribed = {a["pane_id"] for a in initial}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -1951,7 +2032,14 @@ def watch_session(socket_path, midi, tracker, controller, automation, names=None
         while True:
             midi.maintain()
             sorted_changed = controller.poll(midi)
-            if midi.take_refresh() or sorted_changed:
+            if sorted_changed:
+                try:
+                    panel_sort.request()
+                except Exception as error:
+                    log(f"cannot change Herdr panel sorting: {error}")
+                    panel_sort.read()
+            panel_changed = panel_sort.read()
+            if midi.take_refresh() or sorted_changed or panel_changed:
                 automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
             names.sync(automation.agents, tracker.colors)
@@ -1969,14 +2057,11 @@ def watch_session(socket_path, midi, tracker, controller, automation, names=None
                 chunk = sock.recv(4096)
             except TimeoutError:
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    if automation.tracks_blocked():
-                        # Focus changes have no event; follow them for the risk light.
-                        agents = snapshot(socket_path)
-                        if {a["pane_id"] for a in agents} != subscribed:
-                            raise BridgeError("Herdr agent set changed; resubscribing")
-                        automation.publish(midi, tracker, agents, notify=True)
-                    else:
-                        midi.heartbeat()
+                    # Focus/seen and layout changes have no agent-state event.
+                    agents = snapshot(socket_path)
+                    if {a["pane_id"] for a in agents} != subscribed:
+                        raise BridgeError("Herdr agent set changed; resubscribing")
+                    automation.publish(midi, tracker, agents, notify=True)
                     last_heartbeat = time.monotonic()
                 continue
             if not chunk:
@@ -2040,10 +2125,10 @@ def self_test():
         notify=True,
     )
     assert overflow["overflow"], overflow
-    assert overflow["slots"] == [1 << 5, 0, 2 << 5, 3 << 5], overflow
-    assert tracker.slots == ["p1", "p2", "p3", "p4"]
+    assert overflow["slots"] == [1 << 5, 2 << 5, 3 << 5, 0], overflow
+    assert tracker.slots == ["p5", "p4", "p3", "p2"]
 
-    tracker.sort = SORT_RECENCY
+    tracker.sort = SORT_GROUPED
     recent = tracker.update(
         [
             {"pane_id": f"p{i}", "agent_status": "idle", "state_change_seq": i}
@@ -2051,9 +2136,12 @@ def self_test():
         ],
         notify=False,
     )
-    assert tracker.slots == ["p5", "p4", "p3", "p2"]
-    assert recent["slots"] == [1 << 5, 3 << 5, 2 << 5, 0], recent
-    tracker.sort = SORT_CRITICALITY
+    assert tracker.slots == ["p1", "p2", "p3", "p4"]
+    assert recent["slots"] == [1 << 5, 0, 3 << 5, 2 << 5], recent
+    tracker.sort = SORT_PRIORITY
+
+    # Metadata tests use a fixed color fixture, independent of ordering.
+    tracker.colors = {"p2": 0, "p3": 2, "p4": 3, "p5": 1}
 
     # Agent names follow the keyboard colors: each agent carries its name in
     # exactly one token, agents off the board get the plain one, departed
@@ -2377,8 +2465,8 @@ Client 131 : "Other" [User Legacy]
                         "agent_status": "blocked",
                         "state_change_seq": 3,
                     },
-                    {"pane_id": "w1:p2", "agent_status": "idle", "state_change_seq": 2},
-                    {"pane_id": "w2:p3", "agent_status": "idle", "state_change_seq": 1},
+                    {"pane_id": "w1:p2", "agent_status": "idle", "state_change_seq": 1},
+                    {"pane_id": "w2:p3", "agent_status": "idle", "state_change_seq": 2},
                 ]
             }
         return fake_herdr(*args)
@@ -2386,13 +2474,13 @@ Client 131 : "Other" [User Legacy]
     sort_tracker = Tracker()
     sort_controller = HerdrController(sort_tracker, command=recency_herdr)
     assert sort_controller.handle(NOTE_AGENT_NEXT, 127)
-    assert commands[-1] == ("agent", "focus", "w2:p3"), "criticality: p1, p3, p2"
-    assert sort_controller.poll(FakeSortMidi()) and sort_tracker.sort == SORT_RECENCY
+    assert commands[-1] == ("agent", "focus", "w2:p3"), "priority: p1, p3, p2"
+    assert sort_controller.poll(FakeSortMidi()) and sort_tracker.sort == SORT_GROUPED
     assert not sort_controller.poll(FakeSortMidi()), "unchanged mode needs no frame"
     assert sort_controller.handle(NOTE_AGENT_NEXT, 127)
-    assert commands[-1] == ("agent", "focus", "w1:p2"), "recency: p1, p2, p3"
+    assert commands[-1] == ("agent", "focus", "w1:p2"), "grouped: p1, p2, p3"
     assert sort_controller.handle(NOTE_AGENT_URGENT, 127)
-    assert commands[-1] == ("agent", "focus", "w1:p1"), "urgent ignores recency"
+    assert commands[-1] == ("agent", "focus", "w1:p1"), "urgent ignores grouped"
 
     class ImmediateFuture:
         def __init__(self, function, arguments):
@@ -2608,12 +2696,12 @@ Client 131 : "Other" [User Legacy]
         for index in range(1, 6)
     ]
     ranked.publish(ranked_midi, ranked_tracker, many, notify=False)
-    assert "p5" not in ranked_tracker.slots
+    assert ranked_tracker.slots == ["p5", "p4", "p3", "p2"]
     _, rank_questions = ranked_client.calls[-1]
     assert rank_questions["role_0"]["type"] == "choice"
     assert rank_questions["attention_0"]["type"] == "score"
     ranked.poll(ranked_midi, ranked_tracker)
-    assert "p5" in ranked_tracker.slots and "p4" not in ranked_tracker.slots
+    assert ranked_tracker.slots == ["p5", "p4", "p3", "p2"], "AI must not reorder the panel slots"
     assert ranked.agent_roles["p1"] == "implementation"
     assert "role" not in ranked._agent_state(dict(many[0], title="changed task"))
     role_call_count = sum(
@@ -2648,10 +2736,10 @@ Client 131 : "Other" [User Legacy]
         tracker, command=attention_herdr, automation=ranked
     )
     assert attention_controller.handle(NOTE_AGENT_NEXT, 127)
-    expected_attention_focus = ("agent", "focus", "w2:p3")
+    expected_attention_focus = ("agent", "focus", "w1:p2")
     assert commands[-1] == expected_attention_focus
     assert attention_controller.handle(NOTE_AGENT_PREV, 127)
-    assert commands[-1] == ("agent", "focus", "w1:p2")
+    assert commands[-1] == ("agent", "focus", "w2:p3")
     assert attention_controller.handle(NOTE_AGENT_URGENT, 127)
     assert commands[-1] == ("agent", "focus", "w1:p1")
 
@@ -2812,8 +2900,8 @@ Client 131 : "Other" [User Legacy]
             self.sent.append((control, value))
             if control == CC_HEARTBEAT and self.herdr:
                 self.inbox.append((MIDI_CHANNEL, CC_ECHO, PROTOCOL))
-                if self.sort is not None:
-                    self.inbox.append((MIDI_CHANNEL, CC_SORT, self.sort))
+            if control == CC_SORT:
+                self.sort = value  # Host updates never echo.
 
         def receive(self):
             messages, self.inbox = self.inbox, []
@@ -2825,7 +2913,7 @@ Client 131 : "Other" [User Legacy]
     now = [100.0]
     boards = {
         "Moonlander Mark I": FakeBoard("Moonlander Mark I"),
-        "Planck EZ Glow": FakeBoard("Planck EZ Glow", sort=SORT_RECENCY),
+        "Planck EZ Glow": FakeBoard("Planck EZ Glow", sort=SORT_GROUPED),
         "Synth": FakeBoard("Synth", herdr=False),
     }
     plugged = list(boards)
@@ -2848,7 +2936,7 @@ Client 131 : "Other" [User Legacy]
         assert all(board.sent[0] == (CC_HEARTBEAT, PROTOCOL) for board in boards.values())
         assert fleet.active is None
         # Echoes confirm Herdr boards; the remembered Planck wins over the first found.
-        assert fleet.receive() == [(MIDI_CHANNEL, CC_SORT, SORT_RECENCY)]
+        assert fleet.receive() == []
         assert fleet.active == ("alsa", "Planck EZ Glow") and fleet.provisional
         assert fleet.take_refresh() and not fleet.take_refresh()
         assert boards["Planck EZ Glow"].marks()[-1] == 1
@@ -2873,14 +2961,13 @@ Client 131 : "Other" [User Legacy]
         fleet.maintain()
         assert opened.count("Synth") == 1
 
-        # A standby board's sort mode is held back; its control note claims it and is swallowed.
-        boards["Moonlander Mark I"].sort = SORT_CRITICALITY
+        # Every board mirrors Herdr's sort mode; a standby board's note claims it and is swallowed.
+        fleet.send(CC_SORT, SORT_GROUPED)
+        assert boards["Moonlander Mark I"].sort == boards["Planck EZ Glow"].sort == SORT_GROUPED
         fleet.heartbeat()
-        passed = fleet.receive()
-        assert passed == [(MIDI_CHANNEL, CC_SORT, SORT_RECENCY)], passed
         boards["Moonlander Mark I"].inbox.append((NOTE_ON, NOTE_ACCEPT, 127))
         claimed = fleet.receive()
-        assert claimed == [(MIDI_CHANNEL, CC_SORT, SORT_CRITICALITY)], claimed
+        assert claimed == [], "claiming a board must not change panel sorting"
         assert fleet.active == ("alsa", "Moonlander Mark I") and not fleet.provisional
         with open(os.path.join(state_dir, "recent-boards")) as handle:
             assert handle.read().splitlines() == ["Moonlander Mark I", "Planck EZ Glow"]
@@ -2893,6 +2980,15 @@ Client 131 : "Other" [User Legacy]
         boards["Moonlander Mark I"].inbox.append((NOTE_ON, NOTE_TAB_NEXT, 127))
         boards["Planck EZ Glow"].inbox.append((NOTE_OFF, NOTE_ACCEPT, 0))
         assert fleet.receive() == [(NOTE_ON, NOTE_TAB_NEXT, 127)]
+
+        # A standby board's sort request claims it without reaching Herdr; the active board's passes.
+        boards["Planck EZ Glow"].inbox.append((MIDI_CHANNEL, CC_SORT, SORT_PRIORITY))
+        assert fleet.receive() == [], "claiming a board must not change panel sorting"
+        assert fleet.active == ("alsa", "Planck EZ Glow")
+        boards["Planck EZ Glow"].inbox.append((MIDI_CHANNEL, CC_SORT, SORT_PRIORITY))
+        assert fleet.receive() == [(MIDI_CHANNEL, CC_SORT, SORT_PRIORITY)]
+        boards["Moonlander Mark I"].inbox.append((NOTE_ON, NOTE_TAB_NEXT, 127))
+        assert fleet.receive() == [] and fleet.active == ("alsa", "Moonlander Mark I")
 
         # Unplugging the active board promotes the other; it stays active when the first returns.
         plugged.remove("Moonlander Mark I")
