@@ -40,6 +40,9 @@ NOTE_AGENT_PICKER = 108
 NOTE_SCRATCHPAD = 109
 NOTE_AGENT_PREV = 110
 NOTE_AGENT_URGENT = 111
+NOTE_PANE_CLOSE = 112  # the firmware only sends closes after a double tap
+NOTE_TAB_CLOSE = 113
+NOTE_WORKSPACE_CLOSE = 114
 CC_HEARTBEAT = 110
 CC_STATE = 111
 CC_SLOT_FIRST = 112
@@ -1648,6 +1651,15 @@ class HerdrController:
             )
         elif control == NOTE_PANE_ZOOM:
             self.command("pane", "zoom", self._focused_pane()["pane_id"], "--toggle")
+        elif control == NOTE_PANE_CLOSE:
+            self.command("pane", "close", self._focused_pane()["pane_id"])
+        elif control == NOTE_TAB_CLOSE:
+            self.command("tab", "close", self._focused_pane()["tab_id"])
+        elif control == NOTE_WORKSPACE_CLOSE:
+            workspace = self._focused_workspace()
+            if workspace is None:
+                raise BridgeError("Herdr has no focused workspace")
+            self.command("workspace", "close", workspace["workspace_id"])
         elif control == NOTE_HUNK:
             self.command(
                 "plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"
@@ -2378,6 +2390,7 @@ Client 131 : "Other" [User Legacy]
                     {
                         "pane_id": "w1:p1",
                         "workspace_id": "w1",
+                        "tab_id": "w1:t1",
                         "cwd": "/project",
                         "focused": True,
                     }
@@ -2409,6 +2422,9 @@ Client 131 : "Other" [User Legacy]
         NOTE_LAZYGIT,
         NOTE_PALETTE,
         NOTE_PANE_ZOOM,
+        NOTE_PANE_CLOSE,
+        NOTE_TAB_CLOSE,
+        NOTE_WORKSPACE_CLOSE,
         NOTE_HUNK,
         NOTE_AGENT_NEXT,
         NOTE_AGENT_PREV,
@@ -2430,6 +2446,9 @@ Client 131 : "Other" [User Legacy]
         ("plugin", "action", "invoke", "open", "--plugin", "herdr-lazygit"),
         ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
         ("pane", "zoom", "w1:p1", "--toggle"),
+        ("pane", "close", "w1:p1"),
+        ("tab", "close", "w1:t1"),
+        ("workspace", "close", "w1"),
         ("plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"),
         ("agent", "focus", "w2:p3"),
         ("agent", "prompt", "w1:p1", "test prompt"),
