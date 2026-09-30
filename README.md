@@ -84,7 +84,7 @@ herdr plugin action invoke stop --plugin panayiotis.qmk-herdr
 An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not** prove the RTP peer, iPad routing, or keyboard is connected. The matching firmware echoes each protocol heartbeat as CC 116 value 3 on channel 15, and the bridge logs `found rtmidi:…` on the first echo; `no heartbeat echo from rtmidi:…` means the end-to-end round trip has been absent for five seconds. The warning clears when echoes resume; the bridge does not repeatedly restart a healthy local MIDI port to compensate for a sleeping iPad.
 
 1. Check `systemctl --user status rtpmidid-qmk-herdr` and `journalctl --user -u rtpmidid-qmk-herdr -n 30`. Repeated control-port timeouts mean the iPad session is not reachable; fix that before debugging LEDs. Repeated `Invitation Rejected (NO)` means the iPad is reachable but refuses fractal: either it already holds its own session to fractal (it dialed out, which rtpmidid exposes as an unused `iPad` port), or its policy does not match fractal. In the RTP-MIDI app, disconnect the host if the iPad initiated the session, leave the iPad's own session enabled, and check that the contact uses the host's Tailscale address and port `5004`; the host's next retry (every 30 seconds) should then connect.
-2. With the Planck connected to the iPad, enable both midimittr routes. Its space bar LED should turn from dim red to dim green when matching heartbeats arrive (enable RGB first).
+2. With the Planck connected to the iPad, enable both midimittr routes. Its space bar LED should turn from dim red to dim yellow when matching heartbeats arrive (enable RGB first).
 3. In a disposable Herdr workspace, use previous/next tab on the keyboard's Herdr layer. The remote session must change tabs: this checks the return path, not just LED output.
 4. Observe working/blocked/done feedback and speaker cues with sounds enabled. Stop the iPad MIDI route: the Planck's space bar LED should turn red and its slot LEDs go dark within five seconds, and the bridge should warn after five seconds. Restore the route and check for `keyboard heartbeat echo restored`.
 5. Repeat after locking/unlocking the iPad, changing Wi-Fi/cellular, unplugging/replugging the Planck, and restarting rtpmidid. After each recovery, verify both LED updates **and** a harmless previous/next tab action; if either fails, check Tailscale, the RTP-MIDI session, and both midimittr routes.
@@ -132,10 +132,10 @@ Linux ALSA rawmidi and `rtmidi:` targets are duplex. Direct CoreMIDI remains sta
 
 ## Keyboard display
 
-- Planck EZ space bar LED (Moonlander: the right's spare key beside K): dim green for the active keyboard, dim blue for a standby one, dim red disconnected.
+- Planck EZ space bar LED (Moonlander: the right's spare key beside K): dim yellow for the active keyboard, dim blue for a standby one, dim red disconnected.
 - Four agent slots (Planck EZ: the center block's top two rows, top left first; Moonlander: the left's spare column beside the index finger, top to bottom): the first four agent entries in Herdr's built-in panel order, excluding group headers. Priority puts blocked, done, working, idle, then unknown first, with newest state changes first within each status and stable layout-order ties. Grouped follows workspace/tab/pane layout order. Previous/next (notes 110/122) walks the full list; most urgent (111) retains its independent urgency/AI behavior.
-- Each agent on the board gets its own color (blue, green, peach, or mauve) and keeps it while it stays there. Idle is dim, working breathes, blocked blinks in a rhythm for its reason, done is bright, and unknown is steady at half brightness in its assigned color.
-- Sort mode on one RGB LED (Planck EZ: the inner bottom-left LED 37, with Scroll Lock moved to center-block LED 29; Moonlander: the right's innermost number-row key): dim yellow for Priority, dim teal for Grouped, dark while disconnected. All boards mirror Herdr. The active board's top-left Herdr-layer key requests a toggle; LEDs change only when the bridge acknowledges it.
+- Each agent on the board gets its own color (blue, yellow, teal, or mauve) and keeps it while it stays there. Idle is dim, working breathes, blocked blinks in a rhythm for its reason, done is bright, and unknown is steady at half brightness in its assigned color.
+- Sort mode on one RGB LED (Planck EZ: the inner bottom-left LED 37, with Scroll Lock moved to center-block LED 29; Moonlander: the right's innermost number-row key): dim green for Priority, dim peach for Grouped, dark while disconnected. All boards mirror Herdr. The active board's top-left Herdr-layer key requests a toggle; LEDs change only when the bridge acknowledges it.
 - The active keyboard's speaker always cues blocked transitions, and every keyboard cues its own connection; TypeSafe can suppress low-value done cues.
 
 The keyboard stops the working animation if bridge heartbeats time out.
@@ -150,7 +150,7 @@ Protocol 3 is required on **both** bridge and keyboards: protocol 2 boards are d
 
 ## Colors in Herdr
 
-The bridge publishes each agent's name, the same label as Herdr's built-in `agent` field, as pane metadata (source `qmk-herdr`). Agents on the board carry it in the token for their keyboard color, `$qmk_blue`, `$qmk_green`, `$qmk_peach`, or `$qmk_mauve`; agents off the board carry it in `$qmk_agent`. Herdr styles tokens per occurrence, not per value, so each agent carries exactly one of the five and the others are cleared. Names expire after 30 seconds unless the bridge refreshes them, so a stopped bridge leaves no stale colors.
+The bridge publishes each agent's name, the same label as Herdr's built-in `agent` field, as pane metadata (source `qmk-herdr`). Agents on the board carry it in the token for their keyboard color, `$qmk_blue`, `$qmk_yellow`, `$qmk_teal`, or `$qmk_mauve`; agents off the board carry it in `$qmk_agent`. Herdr styles tokens per occurrence, not per value, so each agent carries exactly one of the five and the others are cleared. Names expire after 30 seconds unless the bridge refreshes them, so a stopped bridge leaves no stale colors.
 
 Put the five tokens where the built-in `agent` would go, with the firmware's Catppuccin hues:
 
@@ -161,8 +161,8 @@ rows = [
   [
     "state_icon",
     { token = "$qmk_blue", fg = "#89b4fa" },
-    { token = "$qmk_green", fg = "#a6e3a1" },
-    { token = "$qmk_peach", fg = "#fab387" },
+    { token = "$qmk_yellow", fg = "#f9e2af" },
+    { token = "$qmk_teal", fg = "#94e2d5" },
     { token = "$qmk_mauve", fg = "#cba6f7" },
     "$qmk_agent"
   ],

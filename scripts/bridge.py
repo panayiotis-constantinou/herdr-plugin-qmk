@@ -84,7 +84,7 @@ MIDI_PACKET_DATA_SIZE = 256
 METADATA_SOURCE = "qmk-herdr"
 # Herdr styles sidebar tokens per token, not per value, so the agent name goes
 # in the token for its keyboard color, or the plain one for agents off the board.
-COLOR_TOKENS = ["qmk_blue", "qmk_green", "qmk_peach", "qmk_mauve"]
+COLOR_TOKENS = ["qmk_blue", "qmk_yellow", "qmk_teal", "qmk_mauve"]
 PLAIN_TOKEN = "qmk_agent"
 NAME_TOKENS = COLOR_TOKENS + [PLAIN_TOKEN]
 # Names expire unless refreshed, so a stopped bridge leaves no stale colors.
@@ -2172,9 +2172,9 @@ def self_test():
     assert shown() == {
         "p1": {"qmk_agent": "pi"},
         "p2": {"qmk_blue": "claude"},
-        "p3": {"qmk_peach": "reviewer"},
+        "p3": {"qmk_teal": "reviewer"},
         "p4": {"qmk_mauve": "claude"},
-        "p5": {"qmk_green": "claude"},
+        "p5": {"qmk_yellow": "claude"},
     }, reports
     assert all(r["ttl_ms"] == NAME_TTL_MS for r in reports)
     reports.clear()
@@ -2186,7 +2186,7 @@ def self_test():
         "p2": {},
         "p3": {},
         "p4": {"qmk_blue": "claude"},
-        "gone": {"qmk_peach": "claude"},
+        "gone": {"qmk_teal": "claude"},
     }, reports
     assert all("ttl_ms" not in r for r in reports if r["pane_id"] in ("p2", "p3"))
     reports.clear()
