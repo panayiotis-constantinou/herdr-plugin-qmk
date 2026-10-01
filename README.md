@@ -29,11 +29,11 @@ The bridge remembers the last active keyboard across restarts in `recent-boards`
 Keyboards reached through a sequencer port, such as the iPad over RTP-MIDI, cannot be found by probing; name them in `midi-port` with an `rtmidi:` prefix, separated by `|`. They then take part like any other keyboard:
 
 ```sh
-printf '%s\n' 'rtmidi:qmk-herdr-ipad' > "$(herdr plugin config-dir panayiotis.qmk-herdr)/midi-port"
+printf '%s\n' 'rtmidi:qmk-herdr-ipad@rootshell' > "$(herdr plugin config-dir panayiotis.qmk-herdr)/midi-port"
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
 
-Plain device names from older configs (`Moonlander|Planck EZ`) are ignored with a log line on Linux.
+A trailing `@rootshell` marks the board as used through Rootshell (below). Plain device names from older configs (`Moonlander|Planck EZ`) are ignored with a log line on Linux.
 
 ## Optional TypeSafe automation
 
@@ -53,11 +53,11 @@ herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 - **Blocked agents** get one request per blocked episode: a Choice of why the agent is waiting (permission prompt, question, or error) and a Score of how risky approving it is. The keyboard blinks each blocked slot in a rhythm for its reason, and colors Accept green, peach, or red for the focused agent's permission prompt; high risk makes Accept need a double tap. Any real chance of a destructive action counts as high risk even when TypeSafe is unsure.
 - **Score** maintains an attention order for the most-urgent-agent key only. It never overrides panel/LED order or previous/next navigation.
 
-Requests include agent metadata such as pane ID, project path, title, and status. The only terminal output sent is the last 40 lines of a **blocked** agent (`herdr agent read --source recent`), once per blocked episode; clipboard text and the output of agents that are not blocked are never sent. Without an API key, or when ranking fails, existing local behavior continues; completion-chime failures use the deterministic fallback after the two-second request timeout.
+Requests include agent metadata such as pane ID, project path, title, and status. The only terminal output sent is the last 40 lines of a **blocked** agent (`herdr agent read --source recent`), once per blocked episode; the output of agents that are not blocked is never sent. Without an API key, or when ranking fails, existing local behavior continues; completion-chime failures use the deterministic fallback after the two-second request timeout.
 
 ## iPad over RTP-MIDI
 
-The Mosh connection does not carry USB MIDI. Run an RTP-MIDI bridge on the Herdr host and route MIDI in both directions on the iPad:
+The terminal connection (Rootshell over SSH, or Mosh) does not carry USB MIDI. Run an RTP-MIDI bridge on the Herdr host and route MIDI in both directions on the iPad:
 
 ```text
 qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
@@ -70,6 +70,10 @@ qmk-herdr ↔ rtpmidid ↔ RTP-MIDI app ↔ midimittr ↔ Planck EZ
 Configure the host's RTP-MIDI bridge to connect to the iPad over Tailscale, and add the host's Tailscale address to the iPad app's contacts on UDP port `5004`. A LAN-only peer address will not work away from home. iPadOS may suspend network or MIDI apps in the background; verify recovery after locking the screen and changing networks rather than assuming background operation.
 
 Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–127 (except 123) on channel 15 instead of F13–F24, and only counts protocol 3 heartbeats as a connection. The RTP-MIDI connection is duplex; an LED-only route cannot carry keyboard controls. Flashing this firmware replaces the old Herdr Web F-key controls.
+
+### Rootshell control mode
+
+[Rootshell](https://github.com/kitknox/rootshell) can attach to Herdr in control mode, drawing Herdr's tabs and splits as native iPad panes (fallback mode on upstream Herdr). When the active board's `midi-port` entry carries `@rootshell`, the popup keys (Jump picker, Floax, command palette) do nothing and log why: they open Herdr TUI overlays that Rootshell may not draw, and a key should never open something you cannot see or dismiss. Tab-based controls such as LazyGit in a tab and Hunk keep working. Overlays confirmed to show in Rootshell go in `ROOTSHELL_SHOWN` in `scripts/bridge.py`.
 
 Useful actions:
 
@@ -95,6 +99,7 @@ An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not
 python3 scripts/bridge.py --self-test
 python3 scripts/test_panel_sort.py
 python3 scripts/test_lifecycle.py
+python3 scripts/test_session.py
 herdr plugin link --enabled .
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
@@ -130,7 +135,7 @@ The bridge uses MIDI channel 15 and dispatches Note On with velocity `127` for a
 | 123 | Open the command palette (sent by older firmware; current firmware uses 119) |
 | 124 | Send Enter to the agent in the focused pane |
 | 125 | Send Escape to the agent in the focused pane |
-| 126 | Submit clipboard text directly to the focused agent (no TypeSafe request) |
+| 126 | Retired (it submitted the host's clipboard, never the iPad's); logged once |
 | 127 | Send Ctrl-C to the agent in the focused pane |
 
 Plugin-backed controls require Lancodev Jump, Herdr Floax, Herdr LazyGit, the command palette, and Hunk Diff to be installed and enabled.

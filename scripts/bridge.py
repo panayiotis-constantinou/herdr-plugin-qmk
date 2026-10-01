@@ -14,7 +14,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import signal
 import socket
 import struct
@@ -68,8 +67,19 @@ NOTE_AGENT_NEXT = 122
 NOTE_SMART_ACTION = 123
 NOTE_ACCEPT = 124
 NOTE_REJECT = 125
-NOTE_PROMPT = 126
+NOTE_PROMPT = 126  # retired: it submitted the host's clipboard, never the iPad's
 NOTE_CLEAR = 127
+# Popup keys and what they open: Herdr TUI overlays.
+POPUPS = {
+    NOTE_AGENT_PICKER: "the Jump picker",
+    NOTE_SCRATCHPAD: "the Floax scratch shell",
+    NOTE_PALETTE: "the command palette",
+    NOTE_SMART_ACTION: "the command palette",
+}
+# Popups Rootshell control mode is known to draw. Filled from the Rootshell
+# spike: until an overlay is seen working there, its key does nothing while a
+# Rootshell board is active instead of opening something invisible.
+ROOTSHELL_SHOWN = frozenset()
 PROTOCOL = 3
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
@@ -202,6 +212,10 @@ class MidiOut:
 
     def take_refresh(self):
         """True once when every keyboard needs the current frame resent."""
+        return False
+
+    def rootshell_active(self):
+        """Whether the active board is the one used through Rootshell."""
         return False
 
 
@@ -571,12 +585,13 @@ class RtMidiOut(MidiOut):
 class Port:
     """A MIDI port discovery found: identity while present, name kept across replugs."""
 
-    def __init__(self, key, name, factory, named=False, output_only=False):
+    def __init__(self, key, name, factory, named=False, output_only=False, rootshell=False):
         self.key = key
         self.name = name
         self.factory = factory
         self.named = named
         self.output_only = output_only
+        self.rootshell = rootshell
 
 
 class Board:
@@ -587,6 +602,7 @@ class Board:
         self.name = port.name
         self.named = port.named
         self.output_only = port.output_only
+        self.rootshell = port.rootshell
         self.midi = midi
         self.opened_at = now
         self.last_echo = None
@@ -632,7 +648,7 @@ def rtmidi_available():
     return True
 
 
-def make_scanner(rtmidi_names=(), coremidi_names=()):
+def make_scanner(rtmidi_ports=(), coremidi_names=()):
     """Every port worth probing now: local keyboards plus configured rtmidi ports.
 
     Linux finds USB keyboards as ALSA rawmidi cards. macOS lists duplex
@@ -645,14 +661,20 @@ def make_scanner(rtmidi_names=(), coremidi_names=()):
 
     def scan():
         ports = [
-            Port(("rtmidi", name), f"rtmidi:{name}", lambda name=name: RtMidiOut(name), named=True)
-            for name in rtmidi_names
+            Port(
+                ("rtmidi", name),
+                f"rtmidi:{name}",
+                lambda name=name: RtMidiOut(name),
+                named=True,
+                rootshell=rootshell,
+            )
+            for name, rootshell in rtmidi_ports
         ]
         if lister is not None:
             ports += [
                 Port(("rtmidi", name), name, lambda name=name: RtMidiOut(name))
                 for name in lister()
-                if not any(wanted.lower() in name.lower() for wanted in rtmidi_names)
+                if not any(wanted.lower() in name.lower() for wanted, _ in rtmidi_ports)
             ]
         elif sys.platform == "darwin":
             ports += [
@@ -664,6 +686,27 @@ def make_scanner(rtmidi_names=(), coremidi_names=()):
         return ports
 
     return scan
+
+
+def parse_port_list(port_list):
+    """(rtmidi (name, rootshell) pairs, plain entries) from midi-port.
+
+    Entries are separated by `|`. `rtmidi:NAME` names a port discovery cannot
+    find; a trailing `@rootshell` marks it as used through Rootshell.
+    """
+    rtmidi, plain = [], []
+    for entry in (entry.strip() for entry in port_list.split("|")):
+        if not entry:
+            continue
+        if not entry.startswith("rtmidi:"):
+            plain.append(entry)
+            continue
+        name = entry.removeprefix("rtmidi:").strip()
+        rootshell = name.endswith("@rootshell")
+        name = name.removesuffix("@rootshell").strip()
+        if name:
+            rtmidi.append((name, rootshell))
+    return rtmidi, plain
 
 
 class KeyboardFleet(MidiOut):
@@ -693,13 +736,7 @@ class KeyboardFleet(MidiOut):
 
     @classmethod
     def from_config(cls, port_list, state_dir=None):
-        entries = [entry.strip() for entry in port_list.split("|") if entry.strip()]
-        rtmidi_names = [
-            entry.removeprefix("rtmidi:").strip()
-            for entry in entries
-            if entry.startswith("rtmidi:") and entry.removeprefix("rtmidi:").strip()
-        ]
-        plain = [entry for entry in entries if not entry.startswith("rtmidi:")]
+        rtmidi_ports, plain = parse_port_list(port_list)
         coremidi_names = []
         if plain and sys.platform == "darwin" and not rtmidi_available():
             coremidi_names = plain
@@ -708,7 +745,7 @@ class KeyboardFleet(MidiOut):
                 f"ignoring {', '.join(plain)} in midi-port: "
                 "keyboards are found automatically; list only rtmidi: ports"
             )
-        return cls(make_scanner(rtmidi_names, coremidi_names), state_dir)
+        return cls(make_scanner(rtmidi_ports, coremidi_names), state_dir)
 
     # Selection -------------------------------------------------------------
 
@@ -966,6 +1003,10 @@ class KeyboardFleet(MidiOut):
             self._activate(key, "claimed", remember=True)
         return False
 
+    def rootshell_active(self):
+        board = self.boards.get(self.active)
+        return bool(board and board.rootshell)
+
     def take_refresh(self):
         wanted = self.refresh_wanted
         self.refresh_wanted = False
@@ -1042,30 +1083,6 @@ def read_agent_tail(pane_id):
         message = process.stderr.strip() or "unknown error"
         raise BridgeError(f"herdr agent read {pane_id} failed: {message}")
     return process.stdout
-
-
-def read_clipboard():
-    commands = [
-        ("wl-paste", "--no-newline"),
-        ("xclip", "-selection", "clipboard", "-o"),
-        ("pbpaste",),
-    ]
-    for command in commands:
-        if shutil.which(command[0]) is None:
-            continue
-        try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=COMMAND_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            continue
-        if process.returncode == 0 and process.stdout.strip():
-            return process.stdout.rstrip("\x00")
-    raise BridgeError("prompt requires non-empty clipboard text")
 
 
 class TypeSafeClient:
@@ -1559,13 +1576,11 @@ class TypeSafeAutomation:
 
 
 class HerdrController:
-    def __init__(
-        self, tracker, command=run_herdr, clipboard=read_clipboard, automation=None
-    ):
+    def __init__(self, tracker, command=run_herdr, automation=None):
         self.tracker = tracker
         self.command = command
-        self.clipboard = clipboard
         self.automation = automation
+        self.retired_logged = False
 
     def _focused_workspace(self):
         workspaces = self.command("workspace", "list")["workspaces"]
@@ -1598,10 +1613,13 @@ class HerdrController:
         target = items[(current + delta) % len(items)][key]
         self.command(kind, "focus", target)
 
-    def handle(self, control, value):
+    def handle(self, control, value, rootshell=False):
+        """True when the note ran, a reason string when skipped, else False."""
         if value not in (TAP_VELOCITY, HOLD_VELOCITY):
             return False
         held = value == HOLD_VELOCITY
+        if rootshell and control in POPUPS and control not in ROOTSHELL_SHOWN:
+            return f"{POPUPS[control]} is not shown in Rootshell; ignoring note {control}"
         if control in (NOTE_WORKSPACE_PREV, NOTE_WORKSPACE_NEXT):
             self._cycle(
                 "workspace",
@@ -1740,9 +1758,10 @@ class HerdrController:
                 "agent", "send-keys", self._focused_pane()["pane_id"], keys[control]
             )
         elif control == NOTE_PROMPT:
-            pane_id = self._focused_pane()["pane_id"]
-            prompt = self.clipboard()
-            self.command("agent", "prompt", pane_id, prompt)
+            if self.retired_logged:
+                return False
+            self.retired_logged = True
+            return "note 126 is retired: clipboard prompts were removed; remap the key"
         else:
             return False
         return True
@@ -1750,6 +1769,7 @@ class HerdrController:
     def poll(self, midi):
         """Run keyboard controls; True when the keyboard changed its sort mode."""
         sorted_changed = False
+        rootshell = getattr(midi, "rootshell_active", lambda: False)
         for status, control, value in midi.receive():
             if status == MIDI_CHANNEL and control == CC_SORT:
                 sort = SORT_GROUPED if value == SORT_GROUPED else SORT_PRIORITY
@@ -1763,8 +1783,11 @@ class HerdrController:
             elif status != NOTE_ON:
                 continue
             try:
-                if self.handle(control, value):
+                handled = self.handle(control, value, rootshell())
+                if handled is True:
                     log(f"control note {control}")
+                elif handled:
+                    log(handled)
             except Exception as error:
                 log(f"control note {control} failed: {error}")
         return sorted_changed
@@ -1998,7 +2021,7 @@ class AgentNames:
         due = self.refreshed is None or now - self.refreshed >= NAME_REFRESH_SECONDS
         if not due and wanted == self.shown:
             return
-        for pane_id in self.shown.keys() - wanted.keys():
+        for pane_id in sorted(self.shown.keys() - wanted.keys()):
             self._report(pane_id, None)
         for pane_id, shown in wanted.items():
             if due or self.shown.get(pane_id) != shown:
@@ -2024,12 +2047,31 @@ class AgentNames:
                 log(f"agent name for {pane_id} failed: {error}")
 
 
+# Events that can change what the keyboards show. Agent status needs a
+# subscription per pane, so the set is renewed whenever the agents change;
+# focus and layout events let LEDs follow the session without waiting for
+# the heartbeat snapshot.
+EVENT_TYPES = [
+    "pane.agent_detected",
+    "pane.closed",
+    "pane.exited",
+    "pane.focused",
+    "pane.moved",
+    "tab.focused",
+    "tab.moved",
+    "tab.closed",
+    "workspace.focused",
+    "workspace.moved",
+    "workspace.reordered",
+    "workspace.closed",
+    "layout.updated",
+]
+
+
 def subscription_request(agents):
-    subscriptions = [
-        {"type": "pane.agent_detected"},
-        {"type": "pane.closed"},
-        {"type": "pane.exited"},
-    ] + [{"type": "pane.agent_status_changed", "pane_id": a["pane_id"]} for a in agents]
+    subscriptions = [{"type": kind} for kind in EVENT_TYPES] + [
+        {"type": "pane.agent_status_changed", "pane_id": a["pane_id"]} for a in agents
+    ]
     return json.dumps(
         {
             "id": "qmk-herdr-subscribe",
@@ -2039,19 +2081,13 @@ def subscription_request(agents):
     ).encode()
 
 
-def watch_session(socket_path, midi, tracker, controller, automation, names=None):
-    names = names or AgentNames(socket_path)
-    panel_sort = PanelSort(
-        tracker, clear_view=lambda: herdr_request(socket_path, "agent.view.clear", {})
-    )
-    panel_sort.read()
-    initial = snapshot(socket_path)
-    subscribed = {a["pane_id"] for a in initial}
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+def open_events(socket_path, agents):
+    """Subscribe on a new connection; the socket and any bytes past the ack."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
         sock.connect(socket_path)
         sock.settimeout(HEARTBEAT_SECONDS)
-        sock.sendall(subscription_request(initial) + b"\n")
-
+        sock.sendall(subscription_request(agents) + b"\n")
         data = b""
         while b"\n" not in data:
             chunk = sock.recv(4096)
@@ -2065,15 +2101,38 @@ def watch_session(socket_path, midi, tracker, controller, automation, names=None
             raise BridgeError(f"malformed subscription ack: {error}") from error
         if ack.get("result", {}).get("type") != "subscription_started":
             raise BridgeError(f"Herdr rejected event subscription: {ack}")
+    except BaseException:
+        sock.close()
+        raise
+    sock.settimeout(MIDI_POLL_SECONDS)
+    return sock, data
 
-        agents = snapshot(socket_path)
-        changed = {a["pane_id"] for a in agents} != subscribed
-        automation.publish(midi, tracker, agents, notify=False)
+
+def watch_session(socket_path, midi, tracker, controller, automation, names=None):
+    names = names or AgentNames(socket_path)
+    panel_sort = PanelSort(
+        tracker, clear_view=lambda: herdr_request(socket_path, "agent.view.clear", {})
+    )
+    panel_sort.read()
+    initial = snapshot(socket_path)
+    sock, data = open_events(socket_path, initial)
+    stream = {"sock": sock, "data": data, "subscribed": {a["pane_id"] for a in initial}}
+
+    def publish(agents, notify):
+        """Show the agents; renew the subscription when the set changed."""
+        automation.publish(midi, tracker, agents, notify=notify)
+        panes = {a["pane_id"] for a in agents}
+        if panes == stream["subscribed"]:
+            return
+        sock, data = open_events(socket_path, agents)
+        stream["sock"].close()
+        stream.update(sock=sock, data=data, subscribed=panes)
+        # Catch whatever changed while the new stream was starting.
+        automation.publish(midi, tracker, snapshot(socket_path), notify=True)
+
+    try:
+        publish(snapshot(socket_path), notify=False)
         last_heartbeat = time.monotonic()
-        if changed:
-            raise BridgeError("Herdr agent set changed; resubscribing")
-
-        sock.settimeout(MIDI_POLL_SECONDS)
         while True:
             midi.maintain()
             sorted_changed = controller.poll(midi)
@@ -2088,30 +2147,24 @@ def watch_session(socket_path, midi, tracker, controller, automation, names=None
                 automation.refresh(midi, tracker)
             automation.poll(midi, tracker)
             names.sync(automation.agents, tracker.colors)
-            while b"\n" in data:
-                line, data = data.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                agents = snapshot(socket_path)
-                changed = {a["pane_id"] for a in agents} != subscribed
-                automation.publish(midi, tracker, agents, notify=True)
+            lines = stream["data"].split(b"\n")
+            if any(line.strip() for line in lines[:-1]):
+                # A burst of events costs one snapshot.
+                stream["data"] = lines[-1]
+                publish(snapshot(socket_path), notify=True)
                 last_heartbeat = time.monotonic()
-                if changed:
-                    raise BridgeError("Herdr agent set changed; resubscribing")
             try:
-                chunk = sock.recv(4096)
+                chunk = stream["sock"].recv(4096)
             except TimeoutError:
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    # Focus/seen and layout changes have no agent-state event.
-                    agents = snapshot(socket_path)
-                    if {a["pane_id"] for a in agents} != subscribed:
-                        raise BridgeError("Herdr agent set changed; resubscribing")
-                    automation.publish(midi, tracker, agents, notify=True)
+                    publish(snapshot(socket_path), notify=True)
                     last_heartbeat = time.monotonic()
                 continue
             if not chunk:
                 raise BridgeError("Herdr event stream closed")
-            data += chunk
+            stream["data"] += chunk
+    finally:
+        stream["sock"].close()
 
 
 def run(socket_path, port_list, state_dir=None):
@@ -2451,7 +2504,8 @@ def self_test():
     assert sorted(r["pane_id"] for r in reports) == ["gone", "p1", "p4", "p5"], reports
 
     request = subscription_request([{"pane_id": "w1:p1"}])
-    assert request.count(b'"type"') == 4
+    assert request.count(b'"type"') == len(EVENT_TYPES) + 1
+    assert b'"type": "pane.focused"' in request
     assert b'"pane_id": "w1:p1"' in request
 
     parser = MidiParser()
@@ -2646,9 +2700,7 @@ Client 131 : "Other" [User Legacy]
         return {}
 
     tracker.slots = ["w1:p2", None, None, None]
-    controller = HerdrController(
-        tracker, command=fake_herdr, clipboard=lambda: "test prompt"
-    )
+    controller = HerdrController(tracker, command=fake_herdr)
     assert not controller.handle(NOTE_ACCEPT, 0)
     for control in (
         NOTE_WORKSPACE_PREV,
@@ -2676,10 +2728,9 @@ Client 131 : "Other" [User Legacy]
         NOTE_SMART_ACTION,
         NOTE_ACCEPT,
         NOTE_REJECT,
-        NOTE_PROMPT,
         NOTE_CLEAR,
     ):
-        assert controller.handle(control, 127)
+        assert controller.handle(control, 127) is True, control
     expected_commands = [
         ("workspace", "focus", "w2"),
         ("tab", "focus", "w1:t2"),
@@ -2695,7 +2746,6 @@ Client 131 : "Other" [User Legacy]
         ("workspace", "close", "w1"),
         ("plugin", "action", "invoke", "worktree-tab", "--plugin", "hunk.diff"),
         ("agent", "focus", "w2:p3"),
-        ("agent", "prompt", "w1:p1", "test prompt"),
         ("agent", "send-keys", "w1:p1", "enter"),
         ("agent", "send-keys", "w1:p1", "esc"),
         ("agent", "send-keys", "w1:p1", "ctrl+c"),
@@ -2862,18 +2912,27 @@ Client 131 : "Other" [User Legacy]
 
     client = FakeTypeSafeClient()
     smart = TypeSafeAutomation(client, executor=ImmediateExecutor())
-    smart_controller = HerdrController(
-        tracker, command=fake_herdr, clipboard=lambda: "test prompt", automation=smart
-    )
+    smart_controller = HerdrController(tracker, command=fake_herdr, automation=smart)
     commands.clear()
     assert smart_controller.handle(NOTE_SMART_ACTION, 127)
-    assert smart_controller.handle(NOTE_PROMPT, 127)
-    expected = [
-        ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
-        ("agent", "prompt", "w1:p1", "test prompt"),
-    ]
+    expected = [("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette")]
     assert commands == expected
     assert client.calls == []
+
+    # The retired clipboard note says so once, then stays quiet.
+    assert "retired" in smart_controller.handle(NOTE_PROMPT, 127)
+    assert smart_controller.handle(NOTE_PROMPT, 127) is False
+    assert commands == expected
+
+    # On a Rootshell board, popups it may not draw do nothing; tabs still work.
+    for control in POPUPS:
+        assert "Rootshell" in smart_controller.handle(control, 127, rootshell=True)
+    assert commands == expected
+    assert smart_controller.handle(NOTE_HUNK, 127, rootshell=True) is True
+    assert parse_port_list(" rtmidi:qmk-herdr-ipad@rootshell | Moonlander|rtmidi: other |rtmidi:") == (
+        [("qmk-herdr-ipad", True), ("other", False)],
+        ["Moonlander"],
+    )
 
     now = [0.0]
 
