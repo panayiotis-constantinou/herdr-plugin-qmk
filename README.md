@@ -94,11 +94,14 @@ An open `rtmidi:` port only proves the local MIDI endpoint exists. It does **not
 ```sh
 python3 scripts/bridge.py --self-test
 python3 scripts/test_panel_sort.py
+python3 scripts/test_lifecycle.py
 herdr plugin link --enabled .
 herdr plugin action invoke restart --plugin panayiotis.qmk-herdr
 ```
 
 The process log is `qmk-herdr.log` under `HERDR_PLUGIN_STATE_DIR`; Herdr exposes action output with `herdr plugin log`.
+
+One bridge runs per state directory, whichever plugin root or checkout started it: the running bridge holds a lock on `qmk-herdr.lock` there, and `restart` and `stop` act on whichever process holds it. They also stop bridges left running by versions before 0.8.1, which tracked only the latest of them.
 
 ## Keyboard controls
 

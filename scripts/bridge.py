@@ -8,12 +8,14 @@ CoreMIDI through ctypes on macOS. No compiled binary, no dependencies.
 
 import concurrent.futures
 import ctypes
+import fcntl
 import glob
 import json
 import os
 import queue
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -96,6 +98,15 @@ NAME_TOKENS = COLOR_TOKENS + [PLAIN_TOKEN]
 # Names expire unless refreshed, so a stopped bridge leaves no stale colors.
 NAME_TTL_MS = 30_000
 NAME_REFRESH_SECONDS = 10.0
+# The running bridge holds a POSIX record lock on this state-dir file, so one
+# bridge runs per state dir whichever plugin root (Nix generation) started it.
+LOCK_FILE = "qmk-herdr.lock"
+LOG_FILE = "qmk-herdr.log"
+LIFECYCLE_COMMANDS = ("start", "stop", "restart", "status")
+STOP_SECONDS = 2.0
+START_SECONDS = 3.0
+# Bridges from before the lock, started from any plugin root or checkout.
+LEGACY_BRIDGE_RE = re.compile(r"qmk-herdr[^/]*/scripts/bridge\.py$")
 
 STATUS_CODES = {"idle": 0, "working": 1, "blocked": 2, "done": 3, "unknown": 4}
 STATUS_PRIORITY = ["blocked", "working", "done", "unknown", "idle"]
@@ -2127,6 +2138,217 @@ def run(socket_path, port_list, state_dir=None):
             time.sleep(1)
 
 
+# Lifecycle -------------------------------------------------------------------
+
+
+def _flock_struct(lock_type):
+    """A struct flock covering the whole file, in this platform's layout."""
+    if sys.platform == "darwin":
+        return struct.pack("qqihh", 0, 0, 0, lock_type, os.SEEK_SET)
+    return struct.pack("hhqqi4x", lock_type, os.SEEK_SET, 0, 0, 0)
+
+
+def _flock_holder(data):
+    if sys.platform == "darwin":
+        _start, _length, pid, lock_type, _whence = struct.unpack("qqihh", data)
+    else:
+        lock_type, _whence, _start, _length, pid = struct.unpack("hhqqi4x", data)
+    return None if lock_type == fcntl.F_UNLCK else pid
+
+
+def running_pid(state_dir):
+    """Pid of the bridge holding the state dir's lock, or None.
+
+    F_GETLK only asks, so a status check never races a bridge starting up.
+    """
+    try:
+        fd = os.open(os.path.join(state_dir, LOCK_FILE), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        return _flock_holder(fcntl.fcntl(fd, fcntl.F_GETLK, _flock_struct(fcntl.F_WRLCK)))
+    finally:
+        os.close(fd)
+
+
+_held_lock = None
+
+
+def hold_lock(state_dir):
+    """Take the state dir's lock for the rest of this process; False when taken.
+
+    A POSIX lock drops when its owner closes any descriptor of the file, so
+    only this function ever opens it in the bridge.
+    """
+    global _held_lock
+    fd = os.open(os.path.join(state_dir, LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    _held_lock = fd
+    return True
+
+
+def stray_bridges(listing, uid, exclude=()):
+    """Pids in `ps -Ao pid=,uid=,command=` output running a pre-lock bridge."""
+    pids = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        pid = int(fields[0])
+        if int(fields[1]) != uid or pid in exclude:
+            continue
+        command = fields[2:]
+        script = next(
+            (index for index, arg in enumerate(command[:2]) if LEGACY_BRIDGE_RE.search(arg)),
+            None,
+        )
+        if script is None:
+            continue
+        rest = command[script + 1 :]
+        # Lock holders run `run`; lifecycle calls and tests are not daemons.
+        if rest and rest[0] in LIFECYCLE_COMMANDS + ("run", "--self-test"):
+            continue
+        pids.append(pid)
+    return pids
+
+
+def find_strays(holder):
+    try:
+        listing = subprocess.run(
+            ["ps", "-Ao", "pid=,uid=,command="],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return stray_bridges(listing, os.getuid(), {os.getpid(), holder})
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate(pids):
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + STOP_SECONDS
+    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def stop_bridges(state_dir):
+    holder = running_pid(state_dir)
+    strays = find_strays(holder)
+    if strays:
+        print(f"qmk-herdr: stopping pre-lock bridges: {', '.join(map(str, strays))}")
+    terminate(([holder] if holder else []) + strays)
+    # The pid file from before the lock only ever named one of them.
+    try:
+        os.unlink(os.path.join(state_dir, "qmk-herdr.pid"))
+    except FileNotFoundError:
+        pass
+    return holder is not None or bool(strays)
+
+
+def start_bridge(state_dir, config_dir, command=None):
+    holder = running_pid(state_dir)
+    strays = find_strays(holder)
+    if strays:
+        print(f"qmk-herdr: stopping pre-lock bridges: {', '.join(map(str, strays))}")
+        terminate(strays)
+    if holder is not None:
+        print(f"qmk-herdr is running (pid {holder})")
+        return 0
+    if command is None:
+        command = [sys.executable, os.path.abspath(__file__), "run"]
+        try:
+            with open(os.path.join(config_dir, "midi-port"), encoding="utf-8") as handle:
+                port_list = handle.read().strip()
+        except FileNotFoundError:
+            port_list = ""
+        if port_list:
+            command.append(port_list)
+    log_path = os.path.join(state_dir, LOG_FILE)
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    deadline = time.monotonic() + START_SECONDS
+    while time.monotonic() < deadline:
+        if running_pid(state_dir) == child.pid:
+            print(f"qmk-herdr started (pid {child.pid})")
+            return 0
+        if child.poll() is not None:
+            break
+        time.sleep(0.05)
+    if child.poll() is None:
+        terminate([child.pid])
+    with open(log_path, encoding="utf-8") as handle:
+        sys.stderr.write(handle.read())
+    print("qmk-herdr failed to start", file=sys.stderr)
+    return 1
+
+
+def bridge_status(state_dir):
+    holder = running_pid(state_dir)
+    strays = find_strays(holder)
+    if strays:
+        print(f"pre-lock bridges also running: {', '.join(map(str, strays))}; restart stops them")
+    if holder is None:
+        print("qmk-herdr is stopped")
+        try:
+            with open(os.path.join(state_dir, LOG_FILE), encoding="utf-8") as handle:
+                sys.stdout.write("".join(handle.readlines()[-20:]))
+        except FileNotFoundError:
+            pass
+        return 1
+    print(f"qmk-herdr is running (pid {holder})")
+    try:
+        with open(os.path.join(state_dir, "boards"), encoding="utf-8") as handle:
+            sys.stdout.write(handle.read())
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def lifecycle(action, state_dir, config_dir):
+    os.makedirs(state_dir, exist_ok=True)
+    if action == "status":
+        return bridge_status(state_dir)
+    if action in ("stop", "restart"):
+        stop_bridges(state_dir)
+        if action == "stop":
+            print("qmk-herdr stopped")
+            return 0
+    return start_bridge(state_dir, config_dir)
+
+
 def self_test():
     tracker = Tracker()
     first = tracker.update(
@@ -3082,18 +3304,30 @@ Client 131 : "Other" [User Legacy]
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+    args = sys.argv[1:]
+    if args and args[0] == "--self-test":
         self_test()
         return
+    state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if args and args[0] in LIFECYCLE_COMMANDS:
+        config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+        if not state_dir or not config_dir:
+            print("qmk-herdr: run lifecycle commands through the plugin's actions", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(lifecycle(args[0], state_dir, config_dir))
+    # `run [ports]` is the daemon; bare `[ports]` still runs it in the foreground.
+    if args and args[0] == "run":
+        args = args[1:]
     socket_path = os.environ.get("HERDR_SOCKET_PATH")
     if not socket_path:
         log("HERDR_SOCKET_PATH is missing; run qmk-herdr inside a Herdr pane")
         sys.exit(1)
-    run(
-        socket_path,
-        sys.argv[1] if len(sys.argv) > 1 else "",
-        os.environ.get("HERDR_PLUGIN_STATE_DIR"),
-    )
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+        if not hold_lock(state_dir):
+            log(f"another bridge is running (pid {running_pid(state_dir)}); exiting")
+            sys.exit(1)
+    run(socket_path, args[0] if args else "", state_dir)
 
 
 if __name__ == "__main__":
