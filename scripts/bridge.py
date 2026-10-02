@@ -76,10 +76,11 @@ POPUPS = {
     NOTE_PALETTE: "the command palette",
     NOTE_SMART_ACTION: "the command palette",
 }
-# Popups Rootshell control mode is known to draw. Filled from the Rootshell
-# spike: until an overlay is seen working there, its key does nothing while a
-# Rootshell board is active instead of opening something invisible.
-ROOTSHELL_SHOWN = frozenset()
+# Popups Rootshell control mode is known to draw, from the Rootshell spike:
+# Floax and the command palette show there, the Jump picker does not. Any
+# other popup key does nothing while a Rootshell board is active instead of
+# opening something invisible.
+ROOTSHELL_SHOWN = frozenset({NOTE_SCRATCHPAD, NOTE_PALETTE, NOTE_SMART_ACTION})
 PROTOCOL = 3
 EMPTY_SLOT = 7
 SLOT_COUNT = 4
@@ -2924,10 +2925,17 @@ Client 131 : "Other" [User Legacy]
     assert smart_controller.handle(NOTE_PROMPT, 127) is False
     assert commands == expected
 
-    # On a Rootshell board, popups it may not draw do nothing; tabs still work.
-    for control in POPUPS:
-        assert "Rootshell" in smart_controller.handle(control, 127, rootshell=True)
+    # On a Rootshell board, popups it does not draw do nothing; tabs still work.
+    assert "Jump" in smart_controller.handle(NOTE_AGENT_PICKER, 127, rootshell=True)
     assert commands == expected
+    for control in (NOTE_SCRATCHPAD, NOTE_PALETTE, NOTE_SMART_ACTION):
+        assert smart_controller.handle(control, 127, rootshell=True) is True
+    expected += [
+        ("plugin", "action", "invoke", "toggle", "--plugin", "herdr-floax"),
+        ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
+        ("plugin", "action", "invoke", "open", "--plugin", "jt.command-palette"),
+    ]
+    assert commands == expected, commands
     assert smart_controller.handle(NOTE_HUNK, 127, rootshell=True) is True
     assert parse_port_list(" rtmidi:qmk-herdr-ipad@rootshell | Moonlander|rtmidi: other |rtmidi:") == (
         [("qmk-herdr-ipad", True), ("other", False)],

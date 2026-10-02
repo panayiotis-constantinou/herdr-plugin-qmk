@@ -73,7 +73,7 @@ Flash the matching QMK firmware: its Herdr layer sends Note On/Off 100–127 (ex
 
 ### Rootshell control mode
 
-[Rootshell](https://github.com/kitknox/rootshell) can attach to Herdr in control mode, drawing Herdr's tabs and splits as native iPad panes (fallback mode on upstream Herdr). When the active board's `midi-port` entry carries `@rootshell`, the popup keys (Jump picker, Floax, command palette) do nothing and log why: they open Herdr TUI overlays that Rootshell may not draw, and a key should never open something you cannot see or dismiss. Tab-based controls such as LazyGit in a tab and Hunk keep working. Overlays confirmed to show in Rootshell go in `ROOTSHELL_SHOWN` in `scripts/bridge.py`.
+[Rootshell](https://github.com/kitknox/rootshell) can attach to Herdr in control mode, drawing Herdr's tabs and splits as native iPad panes (fallback mode on upstream Herdr). When the active board's `midi-port` entry carries `@rootshell`, the Jump picker key does nothing and logs why: Rootshell does not draw that overlay, and a key should never open something you cannot see or dismiss. Floax and the command palette do show there and keep working, as do tab-based controls such as LazyGit in a tab and Hunk. `ROOTSHELL_SHOWN` in `scripts/bridge.py` lists the overlays Rootshell draws.
 
 Useful actions:
 
